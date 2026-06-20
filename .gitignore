@@ -1,0 +1,26 @@
+# 1. ROS2编译、安装、日志产物
+build/
+install/
+log/
+devel/
+
+# 2. VS Code全层级缓存与索引文件
+**/.vscode/
+*.db
+*.db-shm
+*.db-wal
+
+# 3. 临时文件、环境变量文件
+.env
+*.tmp
+*.log
+
+# 4. Python编译缓存（ROS2 Python包自动生成）
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 5. 系统垃圾文件
+.DS_Store
+Thumbs.db
