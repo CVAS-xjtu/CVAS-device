@@ -20,14 +20,14 @@ class TimeSyncMatcher:
         self.queue_b = deque()
 
     def add_data_a(self, data: Any, ts: float = None):
-        """添加A路数据（左相机/图像），不传ts自动取当前系统时间"""
+        """添加A路数据 (左相机/图像), 不传ts自动取当前系统时间"""
         if ts is None:
             ts = time.time()
         self.queue_a.append((ts, data))
         self._prune_expired()
 
     def add_data_b(self, data: Any, ts: float = None):
-        """添加B路数据（右相机/IMU/GPS）"""
+        """添加B路数据 (右相机/IMU/GPS) """
         if ts is None:
             ts = time.time()
         self.queue_b.append((ts, data))
@@ -46,7 +46,7 @@ class TimeSyncMatcher:
     def find_best_match(self) -> Optional[Tuple[Any, Any]]:
         """
         查找时间差最小、小于阈值的一对数据
-        返回 (data_a, data_b)，无匹配返回None
+        返回 (data_a, data_b), 无匹配返回None
         """
         best_pair = None
         min_diff = float("inf")
@@ -72,7 +72,7 @@ class TimeSyncMatcher:
 class MultiTimeSyncMatcher:
     """
     支持N路传感器统一时间戳匹配
-    可同时管理：左相机、右相机、IMU、GPS、雷达等多路数据
+    可同时管理: 左相机、右相机、IMU、GPS、雷达等多路数据
     """
     def __init__(self, max_cache_ms=100, match_threshold_ms=8):
         self.max_cache_sec = max_cache_ms / 1000.0
@@ -105,7 +105,7 @@ class MultiTimeSyncMatcher:
     def get_fully_matched_group(self, sensor_list: List[str]) -> Optional[Dict[str, Any]]:
         """
         传入需要全部对齐的传感器列表，返回一套时间匹配的完整数据
-        返回 {sensor_name: data}，缺少任意一路匹配则返回None
+        返回 {sensor_name: data}, 缺少任意一路匹配则返回None
         """
         # 收集所有传感器全部(ts, data)
         all_groups = []

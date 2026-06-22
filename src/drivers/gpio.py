@@ -1,4 +1,4 @@
-from .env_check import is_real_jetson, is_sim_env, SIM_LOG
+from .env_check import is_real_jetson, SIM_LOG
 
 # ====================== 仿真实现类，1:1对齐Jetson.GPIO API ======================
 class _SimGPIO:
