@@ -3,10 +3,8 @@ import cv2
 import numpy as np
 import threading
 import traitlets
-import time
 from jetcam.csi_camera import CSICamera  # type: ignore
 from .env_check import is_real_jetson, SIM_LOG
-from .time_sync import TimeSyncMatcher
 
 # ------------------------------
 # _SimCamera 模拟官方Camera类，仿真环境下使用本地视频流代替CSI相机
@@ -26,13 +24,10 @@ class _SimCamera(traitlets.HasTraits):
     capture_width = traitlets.Integer(default_value=640)
     capture_height = traitlets.Integer(default_value=480)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, sim_video_map: dict, *args, **kwargs):
         super(_SimCamera, self).__init__(*args, **kwargs)
         # 视频路径映射表
-        self.video_map = {
-        0: "../sim_data/cam0.mp4",
-        1: "../sim_data/cam1.mp4"
-        }
+        self._sim_video_map = sim_video_map
         # 模仿Camera类的初始化逻辑，禁止外部调用非官方接口
         if self.format == 'bgr8':
             self.value = np.empty((self.height, self.width, 3), dtype=np.uint8)
@@ -54,9 +49,9 @@ class _SimCamera(traitlets.HasTraits):
     def _video_path(self):
         # 根据 capture_device 获取对应的视频路径，禁止外部调用非官方接口
         dev_id = self.capture_device
-        if dev_id not in self.video_map:
-            raise ValueError(f"设备号 {dev_id} 无对应视频配置，当前仅支持设备：{list(self.video_map.keys())}")
-        return self.video_map[dev_id]
+        if dev_id not in self._sim_video_map:
+            raise ValueError(f"设备号 {dev_id} 无对应视频配置，当前仅支持设备：{list(self._sim_video_map.keys())}")
+        return self._sim_video_map[dev_id]
 
     def _read(self):
         # 模拟CSICamera从视频中读取一帧，禁止外部调用非官方接口
@@ -75,7 +70,6 @@ class _SimCamera(traitlets.HasTraits):
             if not self._running:
                 break
             self.value = self._read()
-            time.sleep(1 / self.capture_fps)
 
     @traitlets.observe('running')
     def _on_running(self, change):
@@ -88,7 +82,7 @@ class _SimCamera(traitlets.HasTraits):
         elif change['old'] and not change['new']:
             # transition from running -> not running
             self._running = False
-            self.thread.join()
+            self.thread.join(timeout=1.0)
 
 
 # ------------------------------
@@ -96,38 +90,66 @@ class _SimCamera(traitlets.HasTraits):
 # 屏蔽底层running/value原生属性，上层禁止直接访问impl
 # ------------------------------
 class _Camera:
-    def __init__(self, device_id: int, width: int, height: int, video_path=None):
-        self.device_id = device_id
-        self.width = width
-        self.height = height
+    def __init__(self, cfg: dict, side: str, sim_video_map: dict):
+        self.side = side
+        cam_cfg = cfg.get(self.side, {})
+        required_keys = ["device_id", "width", "height", "capture_fps", "capture_width", "capture_height"]
+        missing_keys = [k for k in required_keys if k not in cam_cfg]
+        if missing_keys:
+            raise ValueError(f"[{self.side}] 相机配置缺失必填字段：{missing_keys}")
+
+        self.sim_video_map = sim_video_map
+        self.device_id = cam_cfg["device_id"]
+        self.width = cam_cfg["width"]
+        self.height = cam_cfg["height"]
+        self.capture_fps = cam_cfg["capture_fps"]
+        self.capture_width = cam_cfg["capture_width"]
+        self.capture_height = cam_cfg["capture_height"]
 
         self.impl = None
 
         if is_real_jetson():
             # 真机：原生JetCam CSICamera
             self.impl = CSICamera(
-                capture_device=device_id,
-                width=width,
-                height=height
+                capture_device=self.device_id,
+                width=self.width,
+                height=self.height,
+                capture_fps=self.capture_fps,
+                capture_width=self.capture_width,
+                capture_height=self.capture_height
             )
-            if SIM_LOG:
-                print(f"[真机相机] 初始化CSI device {device_id}")
         else:
             # 仿真：对齐接口的_SimCamera
             self.impl = _SimCamera(
-                video_path=video_path,
-                width=width,
-                height=height
+                sim_video_map=self.sim_video_map,
+                capture_device=self.device_id,
+                width=self.width,
+                height=self.height,
+                capture_fps=self.capture_fps,
+                capture_width=self.capture_width,
+                capture_height=self.capture_height
             )
+            if SIM_LOG:
+                video_path = self.sim_video_map[self.device_id]
+                print(f"[仿真相机] {self.side} device:{self.device_id} | 分辨率:{self.width}x{self.height} | 视频文件:{video_path}")
 
     def open(self):
+        if self.impl.running:
+            return
         self.impl.running = True
 
     def stop(self):
+        if not self.impl.running:
+            return
         self.impl.running = False
 
     def read(self):
-        return self.impl.value.copy()
+        if not self.impl.running:
+            raise RuntimeError(f"{self.side}相机未启动, 请先调用open()")
+        if self.impl.value is None or self.impl.value.size == 0:
+            raise RuntimeError(f"{self.side}相机无有效图像帧")
+        frame = self.impl.value.copy()
+        return frame
 
 
 # ------------------------------
@@ -135,10 +157,11 @@ class _Camera:
 # 业务层只调用这三个方法，完全不碰running、value属性
 # ------------------------------
 class StereoCamera:
-    def __init__(self, width=224, height=224, left_video=None, right_video=None, match_threshold_ms=8):
-        self.left = _Camera(device_id=0, width=width, height=height, video_path=left_video)
-        self.right = _Camera(device_id=1, width=width, height=height, video_path=right_video)
-        self.sync_matcher = TimeSyncMatcher(max_cache_ms=100, match_threshold_ms=match_threshold_ms)
+    def __init__(self, camera_cfg: dict):
+        self.camera_cfg = camera_cfg
+        sim_video_map = self.camera_cfg["sim_video_map"]
+        self.left = _Camera(cfg=self.camera_cfg, side="left", sim_video_map=sim_video_map)
+        self.right = _Camera(cfg=self.camera_cfg, side="right", sim_video_map=sim_video_map)
 
     def open(self):
         """启动左右相机采集线程"""
@@ -147,37 +170,11 @@ class StereoCamera:
 
     def stop(self):
         """停止左右相机采集线程"""
-        self.sync_matcher.clear()
         self.left.stop()
         self.right.stop()
 
-    def read(self, timeout_ms=5000):
-        """
-        阻塞读取一对时间同步的左右帧, 替代直接访问value
-        :param timeout_ms: 同步匹配超时时间，防止死循环
-        :return: (left_frame, right_frame)
-        :raises TimeoutError: 超时未匹配到同步帧
-        """
-        if not (self.left.impl.running and self.right.impl.running):
-            raise RuntimeError("请先调用 .open() 启动相机")
-
-        start_time = time.time()
-        timeout_sec = timeout_ms / 1000.0
-        self.sync_matcher.clear()
-
-        while time.time() - start_time < timeout_sec:
-            ts_l = time.time()
-            frame_l = self.left.read()
-            ts_r = time.time()
-            frame_r = self.right.read()
-
-            self.sync_matcher.add_data_a(frame_l, ts_l)
-            self.sync_matcher.add_data_b(frame_r, ts_r)
-
-            match_pair = self.sync_matcher.find_best_match()
-            if match_pair is not None:
-                return match_pair
-
-            time.sleep(0.001)
-
-        raise TimeoutError(f"同步帧读取超时 {timeout_ms}ms，未匹配到满足时间差的双目帧")
+    def read(self):
+        """读取左右相机帧"""
+        left_frame = self.left.read()
+        right_frame = self.right.read()
+        return left_frame, right_frame
