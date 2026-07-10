@@ -1,0 +1,39 @@
+# 源代码、配置文件强制LF换行
+*.py      text eol=lf
+*.sh      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.conf    text eol=lf
+*.cpp     text eol=lf
+*.h       text eol=lf
+*.hpp     text eol=lf
+*.xml     text eol=lf
+*.cfg     text eol=lf
+*.txt     text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+LICENSE   text eol=lf
+
+# 二进制文件，禁止Git修改换行符
+# 图片
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.bmp     binary
+# 压缩包
+*.zip     binary
+*.7z      binary
+*.tar     binary
+*.gz      binary
+# 音频视频
+*.wav     binary
+*.mp3     binary
+*.opus    binary
+*.flac    binary
+*.mp4     binary
+*.mkv     binary
+*.avi     binary
+# 模型权重文件
+*.onnx    binary
+*.pth     binary
+*.bin     binary
