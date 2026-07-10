@@ -27,4 +27,10 @@ Thumbs.db
 
 # 6. 仿真数据文件
 sim_data/
+*.wav
+*.mp3
+*.opus
+*.flac
 *.mp4
+*.mkv
+*.avi
