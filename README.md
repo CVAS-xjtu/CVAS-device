@@ -1,9 +1,10 @@
 # 索引
 - [drivers/](#drivers)
     - [函数与全局变量](#函数与全局变量)
-    - [GPIO](#gpio)
+    - [BaseGPIO](#basegpio)
     - [StereoCamera](#stereocamera)
     - [BluetoothManager](#bluetoothmanager)
+    - [AudioManager](#audiomanager)
 
 # [drivers/](./src/drivers/)
 
@@ -17,8 +18,8 @@
 `SIM_LOG`  
 值为False时取消打印仿真日志，默认打印
 
-## [GPIO:](./src/drivers/gpio.py)
-*静态类，使用时例如 `GPIO.input(3)`*
+## [BaseGPIO:](./src/drivers/gpio.py)
+*静态类，使用时例如 `BaseGPIO.input(3)`*
 
 `setmode(cls, mode)`  
 设置引脚编号模式为BOARD/BCM
@@ -68,3 +69,8 @@
 `get_battery_level(self, force_refresh: bool = False)`  
 读取电池电量百分比，返回值是不带百分号的整数，没有时返回None，force_refresh=True时强制刷新读取电量
 
+## [AudioManager:](./src/drivers/audio.py)
+
+# [audio/](./src/audio/)
+
+## [ASR:](./src/audio/asr.py)
