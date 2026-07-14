@@ -1,37 +1,35 @@
 import time
 import threading
 import os
-import subprocess
 import glob
-from drivers import BluetoothManager, AudioManager
-from audio import asr
+import subprocess
+from typing import Optional, Callable
 from drivers import button
+from drivers import AudioManager
+from audio import asr
 
 
-class VoiceRecorderNode:
-    """
-    假设drivers.button 模块提供的是 on_press(callback) 和 on_release(callback) 接口。
-    """
+class PTTController:
 
     def __init__(
         self,
         device_name: str,
-        record_file_base: str = "/tmp/record_voice",   
+        record_file_base: str = "/tmp/record_voice",
         a2dp_profile: str = "a2dp_sink",
         hsp_profile: str = "headset_head_unit",
         auto_switch_profile: bool = True,
-        asr_func=None,
-        debounce_ms: int = 50,
-        max_keep_files: int = 5,                       # 最多保留文件数
+        asr_func: Optional[Callable] = None,
+        max_keep_files: int = 5,
+        poll_interval: float = 0.02,          # 轮询间隔（秒）
     ):
-        
+    
         self.device_name = device_name
         self.record_file_base = record_file_base
         self.a2dp_profile = a2dp_profile
         self.hsp_profile = hsp_profile
         self.auto_switch_profile = auto_switch_profile
-        self.debounce_ms = debounce_ms
         self.max_keep_files = max_keep_files
+        self.poll_interval = poll_interval
 
         # 确定 ASR 函数
         if asr_func is not None:
@@ -40,38 +38,34 @@ class VoiceRecorderNode:
             if hasattr(asr, 'transcribe'):
                 self.asr_func = asr.transcribe
             elif hasattr(asr, 'SenseVoiceSmall_ASR'):
-                def _asr_wrapper(f):
+                def _wrapper(f):
                     status, text = asr.SenseVoiceSmall_ASR(f)
                     return text if status == 'ok' else None
-                self.asr_func = _asr_wrapper
+                self.asr_func = _wrapper
             else:
                 self.asr_func = None
 
-        self._audio_manager = None
-        self._current_mac = None
 
-        # 按键状态
-        self._key_pressed = False
+        self._audio_manager: Optional[AudioManager] = None
+        self._current_mac: Optional[str] = None
         self._recording_proc = None
-        self._last_press_time = 0
-        self._current_record_file = None   # 当前录音文件路径
-
-        # 线程锁
+        self._current_record_file: Optional[str] = None
+        self._key_pressed = False          # 当前按键状态（True=按下）
+        self._is_recording = False         # 是否正在录音（防止重复触发）
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._polling_thread: Optional[threading.Thread] = None
 
-        # 识别结果回调
-        self.on_result = None
-        self.on_error = None
+        # 回调函数
+        self.on_result: Optional[Callable[[str], None]] = None
+        self.on_error: Optional[Callable[[str], None]] = None
 
-        # button 回调句柄
-        self._press_handler = None
-        self._release_handler = None
-
-        # 初始化设备
+        # 初始化蓝牙设备
         self._init_device()
 
 
-    def _find_mac(self):
+    def _find_mac(self) -> Optional[str]:
+        """根据设备名称查找已配对的蓝牙 MAC 地址"""
         try:
             output = subprocess.check_output(
                 ["bluetoothctl", "paired-devices"],
@@ -104,6 +98,7 @@ class VoiceRecorderNode:
                 self._audio_manager.set_profile(self.a2dp_profile)
                 time.sleep(0.2)
             except Exception as e:
+                # 尝试重新获取 MAC
                 new_mac = self._find_mac()
                 if new_mac and new_mac != mac:
                     self._current_mac = new_mac
@@ -115,11 +110,12 @@ class VoiceRecorderNode:
                             raise RuntimeError("重试后麦克风仍不可用")
                         self._audio_manager.set_profile(self.a2dp_profile)
                     except Exception as e2:
-                        raise RuntimeError(f"初始化设备失败: {e2}")
+                        raise RuntimeError(f"重试初始化失败: {e2}")
                 else:
                     raise RuntimeError(f"初始化设备失败: {e}")
 
-    def _refresh_device_if_needed(self):
+    def _refresh_device_if_needed(self) -> bool:
+        """尝试重新连接设备，返回是否成功"""
         new_mac = self._find_mac()
         if not new_mac:
             return False
@@ -137,87 +133,85 @@ class VoiceRecorderNode:
             pass
         return False
 
-    # ---------- 文件清理 ----------
+    # 文件管理
     def _cleanup_old_files(self):
-        """检查录音文件数量，若超过 max_keep_files 则删除最旧的"""
         try:
-            # 构建匹配模式
             dirname = os.path.dirname(self.record_file_base)
             basename = os.path.basename(self.record_file_base)
             pattern = os.path.join(dirname, f"{basename}_*.wav")
             files = glob.glob(pattern)
-
             if len(files) <= self.max_keep_files:
                 return
-
-            # 按修改时间排序
             files.sort(key=os.path.getmtime)
-            # 删除超出数量的最旧文件
             for f in files[:-self.max_keep_files]:
                 try:
                     os.remove(f)
-                    print(f"[清理] 已删除旧录音文件: {f}")
+                    print(f"[PTT] 已删除旧录音: {f}")
                 except Exception as e:
-                    print(f"[清理] 删除文件失败: {f} - {e}")
+                    print(f"[PTT] 删除文件 {f} 失败: {e}")
         except Exception as e:
-            print(f"[清理] 清理过程异常: {e}")
+            print(f"[PTT] 清理过程异常: {e}")
 
+    # 录音控制
     def _start_recording(self):
-        if self._key_pressed:
-            return
-
-        self._key_pressed = True
+        """按下按钮时调用（线程安全）"""
+        with self._lock:
+            if self._is_recording:
+                return
+            self._is_recording = True
+            self._key_pressed = True
 
         # 生成带时间戳的文件名
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         self._current_record_file = f"{self.record_file_base}_{timestamp}.wav"
-        print(f"[录音] 文件将保存至: {self._current_record_file}")
+        print(f"[PTT] 开始录音 -> {self._current_record_file}")
 
         # 停止当前播放
         if self._audio_manager and self._audio_manager.get_audio_state() == 'playing':
             self._audio_manager.stop_audio()
             time.sleep(0.1)
 
-        # 切换模式
+        # 切换至 HSP 模式
         if self.auto_switch_profile:
             try:
                 self._audio_manager.set_profile(self.hsp_profile)
-                print(f"切换到 {self.hsp_profile}")
                 time.sleep(0.2)
             except Exception as e:
-                print(f"切换模式失败: {e}，尝试刷新设备...")
+                print(f"[PTT] 切换 HSP 失败: {e}，尝试刷新设备...")
                 if not self._refresh_device_if_needed():
+                    self._on_error("无法切换到通话模式")
+                    self._is_recording = False
                     self._key_pressed = False
-                    if self.on_error:
-                        self.on_error("无法切换到通话模式")
                     return
                 try:
                     self._audio_manager.set_profile(self.hsp_profile)
                     time.sleep(0.2)
                 except Exception:
+                    self._on_error("重试切换通话模式失败")
+                    self._is_recording = False
                     self._key_pressed = False
-                    if self.on_error:
-                        self.on_error("重试切换通话模式失败")
                     return
 
-        # 开始录音（异步）
+        # 开始录音（后台异步）
         try:
             self._recording_proc = self._audio_manager.record_file(
                 self._current_record_file, duration=600, wait=False
             )
-            print("录音中...（请释放按键停止）")
+            print("[PTT] 录音中...（请释放按钮停止）")
         except Exception as e:
-            print(f"录音启动失败: {e}")
+            self._on_error(f"录音启动失败: {e}")
+            self._is_recording = False
             self._key_pressed = False
-            if self.on_error:
-                self.on_error(f"录音启动失败: {e}")
 
     def _stop_recording_and_recognize(self):
-        if not self._key_pressed:
-            return
+        """释放按钮时调用（线程安全）"""
+        with self._lock:
+            if not self._is_recording:
+                return
+            self._is_recording = False
+            self._key_pressed = False
 
-        self._key_pressed = False
-        print("[按键] 释放 -> 停止录音，切换模式...")
+        print("[PTT] 释放按钮，停止录音...")
 
         # 停止录音
         if self._audio_manager:
@@ -233,103 +227,93 @@ class VoiceRecorderNode:
         if self.auto_switch_profile and self._audio_manager:
             try:
                 self._audio_manager.set_profile(self.a2dp_profile)
-                print(f"切回 {self.a2dp_profile}")
+                print(f"[PTT] 切回 {self.a2dp_profile}")
             except Exception as e:
-                print(f"切回 A2DP 失败: {e}")
+                print(f"[PTT] 切回 A2DP 失败: {e}")
 
         # 检查录音文件
-        if not self._current_record_file or not os.path.exists(self._current_record_file) or os.path.getsize(self._current_record_file) == 0:
-            msg = "录音文件为空或不存在"
-            print(msg)
-            if self.on_error:
-                self.on_error(msg)
-            # 即使文件无效，也执行清理
-            if self._current_record_file and os.path.exists(self._current_record_file):
+        file_path = self._current_record_file
+        self._current_record_file = None
+
+        if not file_path or not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            self._on_error("录音文件为空或不存在")
+            if file_path and os.path.exists(file_path):
                 try:
-                    os.remove(self._current_record_file)
+                    os.remove(file_path)
                 except:
                     pass
-            self._current_record_file = None
-            self._cleanup_old_files()   # 依然执行清理
+            self._cleanup_old_files()
             return
 
         # 调用 ASR
         text = None
         if self.asr_func is not None:
-            print("正在识别语音...")
+            print("[PTT] 正在识别语音...")
             try:
-                text = self.asr_func(self._current_record_file)
+                text = self.asr_func(file_path)
                 if text:
-                    print(f" 识别结果: {text}")
+                    print(f"[PTT] 识别结果: {text}")
                     if self.on_result:
                         self.on_result(text)
                 else:
-                    msg = "识别结果为空"
-                    print(msg)
-                    if self.on_error:
-                        self.on_error(msg)
+                    self._on_error("识别结果为空")
             except Exception as e:
-                msg = f"ASR 异常: {e}"
-                print(msg)
-                if self.on_error:
-                    self.on_error(msg)
+                self._on_error(f"ASR 异常: {e}")
         else:
-            print("录音完成（未启用识别）")
+            print("[PTT] 录音完成（未启用识别）")
 
         # 清理旧文件
         self._cleanup_old_files()
-        self._current_record_file = None
 
+    def _on_error(self, msg: str):
+        print(f"[PTT] 错误: {msg}")
+        if self.on_error:
+            self.on_error(msg)
 
-    def _on_press(self):
-        with self._lock:
-            now = time.time() * 1000
-            if now - self._last_press_time < self.debounce_ms:
-                return
-            self._last_press_time = now
-            if self._key_pressed:
-                return
-            self._start_recording()
+    # 后台轮询线程
+    def _poll_loop(self):
+        """轮询 button.is_pressed()，按下/释放分别触发录音开始/停止"""
+        last_state = False
+        while not self._stop_event.is_set():
+            current = button.is_pressed()
+            # 检测上升沿（释放 -> 按下）
+            if current and not last_state:
+                self._start_recording()
+            # 检测下降沿（按下 -> 释放）
+            elif not current and last_state:
+                self._stop_recording_and_recognize()
+            last_state = current
+            time.sleep(self.poll_interval)
 
-    def _on_release(self):
-        with self._lock:
-            if not self._key_pressed:
-                return
-            self._stop_recording_and_recognize()
-
+    # 启动/停止
     def start(self):
-        if self._audio_manager is None:
-            raise RuntimeError("设备未初始化，无法启动")
-
-        try:
-            self._press_handler = button.on_press(self._on_press)
-            self._release_handler = button.on_release(self._on_release)
-        except AttributeError:
-            raise RuntimeError("button 模块未提供 on_press/on_release 方法，请检查实现。")
-
-        print("录音节点已启动，按下物理按键触发录音。")
+        """启动 PTT 轮询线程"""
+        if self._polling_thread and self._polling_thread.is_alive():
+            print("[PTT] 轮询线程已在运行")
+            return
+        self._stop_event.clear()
+        self._polling_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._polling_thread.start()
+        print("[PTT] 控制器已启动，按下按钮开始录音。")
 
     def stop(self):
-        if hasattr(button, 'unhook_all'):
-            button.unhook_all()
-        elif self._press_handler is not None and hasattr(button, 'unhook'):
-            button.unhook(self._press_handler)
-            button.unhook(self._release_handler)
+        """停止轮询线程并释放资源"""
+        self._stop_event.set()
+        if self._polling_thread and self._polling_thread.is_alive():
+            self._polling_thread.join(timeout=2)
 
-        # 如果正在录音，停止并识别
-        with self._lock:
-            if self._key_pressed:
-                self._stop_recording_and_recognize()
-            if self._audio_manager:
-                self._audio_manager.stop()
+        # 如果正在录音，强制停止并识别
+        if self._is_recording:
+            self._stop_recording_and_recognize()
 
-        print("录音节点已停止。")
+        if self._audio_manager:
+            self._audio_manager.stop()
 
-    def set_asr_func(self, func):
-        self.asr_func = func
+        print("[PTT] 控制器已停止。")
 
-    def set_result_callback(self, cb):
+    # 回调设置
+    def set_result_callback(self, cb: Callable[[str], None]):
         self.on_result = cb
 
-    def set_error_callback(self, cb):
+    def set_error_callback(self, cb: Callable[[str], None]):
         self.on_error = cb
