@@ -13,7 +13,7 @@ class BluetoothManager:
         # 蓝牙MAC地址
         self._target_mac = self._audio_cfg.get("target_mac", "").strip().upper()
         # 蓝牙连接轮询间隔
-        self._poll_interval = self._audio_cfg.get("reconnect_poll_interval_sec", 5)
+        self._poll_interval = self._audio_cfg.get("reconnect_poll_interval_sec", 3)
         # 蓝牙管理器后台线程休眠间隔
         self._thread_sleep = self._audio_cfg.get("thread_sleep_sec", 0.5)
         # 蓝牙管理器内部循环休眠间隔
