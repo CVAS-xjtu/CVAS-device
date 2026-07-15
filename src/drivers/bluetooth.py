@@ -7,106 +7,64 @@ import re
 
 
 class BluetoothManager:
-    def __init__(self, audio_cfg: dict):
-        # 配置字典
-        self._audio_cfg = audio_cfg
-        # 蓝牙MAC地址
-        self._target_mac = self._audio_cfg.get("target_mac", "").strip().upper()
-        # 蓝牙连接轮询间隔
-        self._poll_interval = self._audio_cfg.get("reconnect_poll_interval_sec", 3)
-        # 蓝牙管理器后台线程休眠间隔
-        self._thread_sleep = self._audio_cfg.get("thread_sleep_sec", 0.5)
-        # 蓝牙管理器内部循环休眠间隔
-        self._inner_loop_sleep = self._audio_cfg.get("inner_loop_sleep_sec", 0.01)
-        # 蓝牙管理器输出缓冲区最大长度
-        self._buf_max_len = self._audio_cfg.get("buf_max_len", 2000)
-        # 蓝牙管理器输出缓冲区保留长度
-        self._buf_reserve_len = self._audio_cfg.get("buf_reserve_len", 1500)
-        # 蓝牙管理器命令超时时间
-        self._cmd_timeout = self._audio_cfg.get("cmd_timeout_sec", 0.5)
-        # 蓝牙管理器线程join超时时间
-        self._thread_join_timeout = self._audio_cfg.get("thread_join_timeout_sec", 1.0)
+    """
+    蓝牙管理器（符合 interaction 节点设计规范）
 
-        if self._thread_sleep <= 0:
-            self._thread_sleep = 0.5
+    职责：管理蓝牙耳机连接、断连、状态查询。
+    子进程（bluetoothctl）由模块内部在 start() 中创建，cleanup() 中销毁。
+    类自身不创建线程；stdout/stderr 消费循环仍保留为线程方法（因 readline 阻塞），
+    重连逻辑改为 check_and_reconnect() 供节点统一轮询。
+    """
+
+    def __init__(self, audio_cfg: dict):
+        # ---------- 配置参数 ----------
+        self._target_mac = audio_cfg.get("target_mac", "").strip().upper()
+        self._poll_interval = audio_cfg.get("reconnect_poll_interval_sec", 3)
+        self._cmd_timeout = audio_cfg.get("cmd_timeout_sec", 0.5)
+        self._buf_max_len = audio_cfg.get("buf_max_len", 2000)
+        self._buf_reserve_len = audio_cfg.get("buf_reserve_len", 1500)
+        self._thread_sleep = audio_cfg.get("thread_sleep_sec", 0.5)
+
         if self._cmd_timeout <= 0 or self._cmd_timeout > 2:
             self._cmd_timeout = 0.5
         if self._buf_reserve_len >= self._buf_max_len:
             self._buf_reserve_len = self._buf_max_len - 500
-        if self._thread_join_timeout <= 0 or self._thread_join_timeout > 3:
-            self._thread_join_timeout = 1.0
 
-        # bluetoothctl子进程
-        self._proc: Optional[subprocess.Popen] = None
-        # 子进程运行状态
+        # ---------- 运行时状态 ----------
         self._running = True
-        # 蓝牙连接状态
         self._connected = False
-        # 是否启用断线自动重连
         self._auto_reconnect = True
-        # 蓝牙耳机电池电量
         self._battery_level: Optional[int] = None
-        # 输出缓冲区
-        self._bt_output_buf = ""
-        # 电量读取正则表达式
+
+        self._proc: Optional[subprocess.Popen] = None
+
+        # 输出缓冲区与条件变量
+        self._output_buf = ""
+        self._buf_lock = threading.Lock()
+        self._buf_cond = threading.Condition(self._buf_lock)
+
         self._battery_re = re.compile(r"\((\d+)\)")
-        # 匹配bluetoothctl提示符：[xxx]#
         self._prompt_re = re.compile(r"\[.*\]#")
-        # 线程安全锁
-        self._state_lock = threading.Lock() # 状态保护
-        self._op_lock = threading.Lock() # 操作保护
-        self._buf_lock = threading.Lock() # 输出缓冲保护
 
-        # 启动 bluetoothctl 常驻进程
-        self._start_btctl()
+        # 重连间隔控制
+        self._last_reconnect_time = 0.0
 
-        # 拉起后台线程
-        self._spawn_background_threads()
+        # ---------- 锁 ----------
+        self._state_lock = threading.Lock()
+        self._op_lock = threading.Lock()
 
-    def _is_alive(self) -> bool:
-        """检查bluetoothctl进程是否存活"""
-        if not self._running:
-            return False
-        if self._proc is None or self._proc.poll() is not None:
-            return False
-        return True
+    # ================================================================
+    #   生命周期方法
+    # ================================================================
 
-
-    def _can_send_command(self) -> bool:
-        """检查是否可以向bluetoothctl发送指令"""
-        return self._is_alive() and self._proc.stdin is not None
-
-
-    def _can_read_output(self) -> bool:
-        """检查是否可以读取bluetoothctl输出"""
-        return self._is_alive() and self._proc.stdout is not None
-    
-
-    def _can_read_stderr(self) -> bool:
-        """检查是否可以读取bluetoothctl错误输出"""
-        return self._is_alive() and self._proc.stderr is not None
-
-
-    def _send_command(self, cmd: str) -> bool:
-        """向交互式bluetoothctl下发单行指令"""
-        if not self._can_send_command():
-            return False
-        try:
-            self._proc.stdin.write(f"{cmd}\n")
-            self._proc.stdin.flush()
-            return True
-        except Exception:
-            return False
-        
-
-    def _start_btctl(self):
-        """启动常驻交互式bluetoothctl终端进程"""
+    def start(self):
+        """初始化硬件资源：创建 bluetoothctl 子进程，发送 power on"""
         with self._op_lock:
-            if self._is_alive():
+            if self._proc is not None:
                 return
             env = os.environ.copy()
             env["LANG"] = "C"
-            env["LC_ALL"] = "C" # 强制英文输出
+            env["LC_ALL"] = "C"
             self._proc = subprocess.Popen(
                 ["bluetoothctl"],
                 stdin=subprocess.PIPE,
@@ -117,31 +75,38 @@ class BluetoothManager:
                 env=env
             )
             self._send_command("power on")
-
-
-    def _spawn_background_threads(self):
-        """统一创建所有后台线程: stdout、stderr、断线重连"""
-        # 输出消费线程
-        self._stdout_thread = threading.Thread(target=self._stdout_consumer, daemon=True)
-        self._stdout_thread.start()
-
-        # 错误流消费线程
-        self._stderr_thread = threading.Thread(target=self._stderr_consumer, daemon=True)
-        self._stderr_thread.start()
-
-        # 断线自动重连线程
-        self._reconn_thread = threading.Thread(target=self._reconnect_loop, daemon=True)
-        self._reconn_thread.start()
-
-
-    def _stdout_consumer(self):
-        """bluetoothctl标准输出消费线程"""
-        while True:
             with self._state_lock:
-                running = self._running
-            if not running:
-                break
-            if not self._is_alive():
+                self._auto_reconnect = True
+
+    def shutdown(self):
+        """置 _running 为 False，结束 stdout/stderr 消费循环"""
+        with self._state_lock:
+            self._running = False
+
+    def cleanup(self):
+        """关闭硬件资源：断开连接，终止子进程"""
+        try:
+            self.disconnect()
+        except Exception:
+            pass
+        with self._op_lock:
+            if self._proc is not None:
+                try:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=2)
+                except Exception:
+                    pass
+                finally:
+                    self._proc = None
+
+    # ================================================================
+    #   进程循环方法（由节点负责放入线程执行）
+    # ================================================================
+
+    def stdout_consumer_loop(self):
+        """消费 bluetoothctl 标准输出（需独立线程，因为 readline 会阻塞）"""
+        while self._running:
+            if self._proc is None or self._proc.poll() is not None:
                 time.sleep(self._thread_sleep)
                 continue
             try:
@@ -149,22 +114,18 @@ class BluetoothManager:
                 if not line:
                     time.sleep(self._thread_sleep)
                     continue
-                with self._buf_lock:
-                    self._bt_output_buf += line
-                    if len(self._bt_output_buf) > self._buf_max_len:
-                        self._bt_output_buf = self._bt_output_buf[-self._buf_reserve_len:]
+                with self._buf_cond:
+                    self._output_buf += line
+                    if len(self._output_buf) > self._buf_max_len:
+                        self._output_buf = self._output_buf[-self._buf_reserve_len:]
+                    self._buf_cond.notify_all()
             except Exception:
                 time.sleep(self._thread_sleep)
 
-
-    def _stderr_consumer(self):
-        """bluetoothctl的错误输出消费线程"""
-        while True:
-            with self._state_lock:
-                running = self._running
-            if not running:
-                break
-            if not self._is_alive():
+    def stderr_consumer_loop(self):
+        """消费 bluetoothctl 错误输出（需独立线程）"""
+        while self._running:
+            if self._proc is None or self._proc.poll() is not None:
                 time.sleep(self._thread_sleep)
                 continue
             try:
@@ -172,157 +133,53 @@ class BluetoothManager:
                 if not line:
                     time.sleep(self._thread_sleep)
                     continue
+                # 可记录错误日志
             except Exception:
                 time.sleep(self._thread_sleep)
 
+    # ---------- 以下为节点统一轮询的重连检查方法 ----------
+    def check_and_reconnect(self):
+        """
+        检查蓝牙连接状态，若需要则尝试重连（由节点统一监控循环调用）。
+        内部自动控制重连间隔，避免频繁操作。
+        本方法不阻塞，无长时间持锁，适合高频调用。
+        """
+        # 1. 保活：若子进程已死，尝试重启
+        with self._op_lock:
+            if self._proc is None or self._proc.poll() is not None:
+                self._start_btctl()  # 内部发送 power on
 
-    def _reconnect_loop(self):
-        """断线自动重连线程"""
-        while True:
+        # 2. 检查是否到重连间隔
+        now = time.time()
+        if now - self._last_reconnect_time < self._poll_interval:
+            return
+
+        # 3. 检查是否启用自动重连（读取状态，持锁时间极短）
+        with self._state_lock:
+            auto = self._auto_reconnect
+        if not auto:
+            return
+
+        # 4. 执行重连逻辑（持 _op_lock 保护命令序列）
+        with self._op_lock:
+            # 刷新连接状态
+            real_conn = self._check_connected()
+            if not real_conn:
+                self._send_command(f"connect {self._target_mac}")
+                real_conn = self._check_connected()
+            # 更新状态
             with self._state_lock:
-                running = self._running
-                auto_reconnect = self._auto_reconnect
-            if not running:
-                break
-            try:
-                self._start_btctl()
-                with self._op_lock:
-                    real_conn = self._check_connected()
-                    if auto_reconnect and not real_conn:
-                        self._send_command(f"connect {self._target_mac}")
-                with self._state_lock:
-                    self._connected = real_conn
-            except Exception:
-                pass
-            time.sleep(self._poll_interval)
+                self._connected = real_conn
+                if real_conn:
+                    self._auto_reconnect = True
+            # 更新最后重连时间
+            self._last_reconnect_time = time.time()
 
-
-    def _check_connected(self) -> bool:
-        """查询当前耳机是否处于已连接状态, 调用前请确保已获取_op_lock锁"""
-        cmd = f"info {self._target_mac}"
-        if not self._send_command(cmd):
-            return False
-        # 记录发送前缓冲区长度
-        with self._buf_lock:
-            start_pos = len(self._bt_output_buf)
-
-        start_time = time.time()
-
-        # 循环等待提示符 [xxx]# 出现，代表命令执行结束
-        found_prompt = False
-        while time.time() - start_time < self._cmd_timeout:
-            with self._buf_lock:
-                new_part = self._bt_output_buf[start_pos:]
-            if self._prompt_re.search(new_part):
-                found_prompt = True
-                break
-            time.sleep(self._inner_loop_sleep)
-
-        if not found_prompt:
-            # 命令超时未返回，判定查询失败
-            return False
-
-        # 只在本次命令新增输出里判断连接状态
-        with self._buf_lock:
-            new_output = self._bt_output_buf[start_pos:]
-        return "Connected: yes" in new_output
-
-
-    def _query_battery_level(self) -> Optional[int]:
-        """查询电池电量, 调用前请确保已获取_op_lock锁"""
-        cmd = f"info {self._target_mac}"
-        if not self._send_command(cmd):
-            return None
-        
-        # 记录发送前缓冲区长度
-        with self._buf_lock:
-            start_pos = len(self._bt_output_buf)
-
-        start_time = time.time()
-
-        # 循环等待提示符 [xxx]# 出现，代表命令执行结束
-        found_prompt = False
-        while time.time() - start_time < self._cmd_timeout:
-            with self._buf_lock:
-                new_part = self._bt_output_buf[start_pos:]
-            if self._prompt_re.search(new_part):
-                found_prompt = True
-                break
-            time.sleep(self._inner_loop_sleep)
-        
-        if not found_prompt:
-            # 命令超时未返回，判定查询失败
-            return None
-        
-        # 在本次命令输出内容中匹配Battery字段
-        with self._buf_lock:
-            new_output = self._bt_output_buf[start_pos:]
-
-        for line in new_output.splitlines():
-            if "Battery Percentage" in line:
-                match = self._battery_re.search(line)
-                if match:
-                    try:
-                        return int(match.group(1))
-                    except ValueError:
-                        return None
-        return None
-
-
-
-    # 以下是所有对外提供的连接、断连接口
-    def disconnect(self):
-        """主动断开耳机连接"""
-        new_state = True
-        with self._op_lock:
-            if not self._check_connected():
-                new_state = False
-                return
-            self._send_command(f"disconnect {self._target_mac}")
-            new_state = self._check_connected()
-        with self._state_lock:
-            self._connected = new_state
-            self._battery_level = None
-            self._auto_reconnect = False
-
-
-    def connect(self) -> bool:
-        """主动连接耳机"""
-        with self._op_lock:
-            if self._check_connected():
-                return True
-            self._send_command(f"connect {self._target_mac}")
-            new_state = self._check_connected()
-        with self._state_lock:
-            self._connected = new_state
-            self._auto_reconnect = True
-        return new_state
-
-
-    def stop(self):
-        """停止蓝牙管理器"""
-        with self._state_lock:
-            self._running = False
-        #等待线程退出
-        for thread in (self._reconn_thread, self._stdout_thread, self._stderr_thread):
-            if thread.is_alive():
-                thread.join(timeout = self._thread_join_timeout)
-        self.disconnect()
-        if self._proc is not None:
-            self._proc.terminate()
-            self._proc.wait()
-            self._proc = None
-
-
-
-    # 以下是所有对外提供的查询接口
-    def get_target_mac(self) -> str:
-        """获取目标蓝牙MAC地址"""
-        return self._target_mac
-
+    # ================================================================
+    #   状态查询方法
+    # ================================================================
 
     def is_connected(self, force_refresh: bool = False) -> bool:
-        """查询当前耳机是否已连接"""
         if force_refresh:
             with self._op_lock:
                 res = self._check_connected()
@@ -332,9 +189,7 @@ class BluetoothManager:
         with self._state_lock:
             return self._connected
 
-
     def get_battery_level(self, force_refresh: bool = False) -> Optional[int]:
-        """获取电池电量"""
         if force_refresh:
             with self._op_lock:
                 res = self._query_battery_level()
@@ -343,3 +198,112 @@ class BluetoothManager:
             return self._battery_level
         with self._state_lock:
             return self._battery_level
+
+    def get_target_mac(self) -> str:
+        return self._target_mac
+
+    # ================================================================
+    #   业务操作方法
+    # ================================================================
+
+    def connect(self) -> bool:
+        with self._op_lock:
+            if self._check_connected():
+                with self._state_lock:
+                    self._connected = True
+                return True
+            self._send_command(f"connect {self._target_mac}")
+            new_state = self._check_connected()
+        with self._state_lock:
+            self._connected = new_state
+            self._auto_reconnect = True
+        return new_state
+
+    def disconnect(self):
+        with self._op_lock:
+            if not self._check_connected():
+                with self._state_lock:
+                    self._connected = False
+                return
+            self._send_command(f"disconnect {self._target_mac}")
+            new_state = self._check_connected()
+        with self._state_lock:
+            self._connected = new_state
+            self._battery_level = None
+            self._auto_reconnect = False
+
+    # ================================================================
+    #   内部辅助方法
+    # ================================================================
+
+    def _send_command(self, cmd: str) -> bool:
+        if self._proc is None or self._proc.poll() is not None:
+            return False
+        try:
+            self._proc.stdin.write(f"{cmd}\n")
+            self._proc.stdin.flush()
+            return True
+        except Exception:
+            return False
+
+    def _start_btctl(self):
+        """启动 bluetoothctl 进程（需在 _op_lock 内调用）"""
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        env = os.environ.copy()
+        env["LANG"] = "C"
+        env["LC_ALL"] = "C"
+        self._proc = subprocess.Popen(
+            ["bluetoothctl"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env
+        )
+        self._send_command("power on")
+
+    def _send_and_wait_for_prompt(self, cmd: str) -> bool:
+        if not self._send_command(cmd):
+            return False
+        with self._buf_lock:
+            start_pos = len(self._output_buf)
+        deadline = time.time() + self._cmd_timeout
+        found_prompt = False
+        while time.time() < deadline:
+            with self._buf_lock:
+                new_part = self._output_buf[start_pos:]
+            if self._prompt_re.search(new_part):
+                found_prompt = True
+                break
+            with self._buf_cond:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._buf_cond.wait(timeout=remaining)
+        return found_prompt
+
+    def _check_connected(self) -> bool:
+        cmd = f"info {self._target_mac}"
+        if not self._send_and_wait_for_prompt(cmd):
+            return False
+        with self._buf_lock:
+            output = self._output_buf
+        return "Connected: yes" in output
+
+    def _query_battery_level(self) -> Optional[int]:
+        cmd = f"info {self._target_mac}"
+        if not self._send_and_wait_for_prompt(cmd):
+            return None
+        with self._buf_lock:
+            output = self._output_buf
+        for line in output.splitlines():
+            if "Battery Percentage" in line:
+                match = self._battery_re.search(line)
+                if match:
+                    try:
+                        return int(match.group(1))
+                    except ValueError:
+                        return None
+        return None
