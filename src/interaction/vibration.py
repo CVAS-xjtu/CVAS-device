@@ -1,15 +1,15 @@
 import time
 import threading
 from typing import Optional
-from drivers import Motor
+from drivers import Vibrator
 
 
 class _VibrateImpl:
     """内部震动控制逻辑：基于时间占比的单侧脉冲震动"""
 
-    def __init__(self, motor_left: Motor, motor_right: Motor, cfg: dict):
-        self.motor_left = motor_left
-        self.motor_right = motor_right
+    def __init__(self, vibrator_left: Vibrator, vibrator_right: Vibrator, cfg: dict):
+        self.vibrator_left = vibrator_left
+        self.vibrator_right = vibrator_right
 
         # 距离参数
         self.max_distance = cfg.get("max_distance", 2.0)    # 超过此距离不震动
@@ -83,8 +83,8 @@ class _VibrateImpl:
     def _stop_all(self):
         """安全关闭左右马达"""
         try:
-            self.motor_left.set_power(0.0)
-            self.motor_right.set_power(0.0)
+            self.vibrator_left.set_power(0.0)
+            self.vibrator_right.set_power(0.0)
         except Exception:
             pass
 
@@ -135,12 +135,12 @@ class _VibrateImpl:
         power = 1.0 if on else 0.0
         if side == 'right':
             # 右侧有障 → 震动左侧马达，关闭右侧
-            self.motor_left.set_power(power)
-            self.motor_right.set_power(0.0)
+            self.vibrator_left.set_power(power)
+            self.vibrator_right.set_power(0.0)
         elif side == 'left':
             # 左侧有障 → 震动右侧马达，关闭左侧
-            self.motor_left.set_power(0.0)
-            self.motor_right.set_power(power)
+            self.vibrator_left.set_power(0.0)
+            self.vibrator_right.set_power(power)
         else:
             self._stop_all()
 
@@ -154,10 +154,10 @@ class Vibrate:
     - update(direction, distance) : 更新障碍物，触发左右侧震动
     """
 
-    def __init__(self, motor_left: Motor, motor_right: Motor, cfg: dict = None):
+    def __init__(self, vibrator_left: Vibrator, vibrator_right: Vibrator, cfg: dict = None):
         if cfg is None:
             cfg = {}
-        self.impl = _VibrateImpl(motor_left, motor_right, cfg)
+        self.impl = _VibrateImpl(vibrator_left, vibrator_right, cfg)
 
     def open(self):
         self.impl.open()
