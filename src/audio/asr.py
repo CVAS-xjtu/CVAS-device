@@ -4,7 +4,7 @@ import threading
 import numpy as np
 from typing import Optional
 
-from .wakeup import WakeupDetector
+from ..interaction.kws import WakeupDetector
 from .preprocess import Denoiser
 
 

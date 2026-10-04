@@ -2,7 +2,7 @@ import atexit
 import cv2
 import numpy as np
 import threading
-import traitlets
+import traitlets # type: ignore
 from jetcam.csi_camera import CSICamera  # type: ignore
 from .env_check import is_real_jetson, SIM_LOG
 

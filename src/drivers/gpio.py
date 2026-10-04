@@ -56,7 +56,7 @@ class _SimGPIO:
 # ====================== 环境自动分支切换 ======================
 if is_real_jetson():
     # 真机：加载官方原生库
-    import Jetson.GPIO as GPIO # type: ignore
+    import Jetson.GPIO as BaseGPIO # type: ignore
 else:
     # WSL/PC仿真：替换仿真类
-    GPIO = _SimGPIO
+    BaseGPIO = _SimGPIO
