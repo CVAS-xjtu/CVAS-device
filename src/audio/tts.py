@@ -11,197 +11,127 @@ from typing import Optional
 from drivers import AudioManager
 
 
-# ------------------------------------------------------------
-# _TTSImpl 内部实现（中文离线语音合成）
-# ------------------------------------------------------------
-class _TTSImpl:
-    """TTS 核心处理类，使用 Piper 中文本地引擎"""
-
-    def __init__(self, cfg: dict, logger: logging.Logger):
+class TTSModule:
+    
+     def __init__(self, cfg: dict = None, logger: logging.Logger = None):
+        if cfg is None:
+            cfg = {}
         self.cfg = cfg
-        self.logger = logger
+        self.logger = logger or logging.getLogger("TTSModule")
 
         # ---------- Piper 中文模型路径（必须配置） ----------
         self.zh_tts_model = cfg.get("zh_tts_model", "/path/to/piper/zh_CN.pth")
         self.zh_tts_json = cfg.get("zh_tts_json", "/path/to/piper/zh_CN.json")
 
-        self.synthesizer = None  # Piper 引擎实例
 
-        # 线程控制
+        self._state_lock = threading.Lock()
+        self._op_lock = threading.Lock()
         self._running = False
-        self._play_thread = None
+        self._synthesizer = None
         self._audio_queue = []
-        self._lock = threading.Lock()
 
-    # ------------------------------------------------------------
-    # 公开方法：open / stop / speak
-    # ------------------------------------------------------------
-    def open(self):
-        """启动合成服务：加载模型并启动后台线程"""
-        if self._running:
-            return
-        self._running = True
+    # ---------------- 生命周期 ----------------
+def start(self):
+        with self._op_lock:
+            self._load_piper_model()
+        with self._state_lock:
+            self._running = True
 
-        # 加载 Piper 中文模型
-        self._load_piper_model()
+def shutdown(self):
+        with self._state_lock:
+            self._running = False
 
-        # 启动后台线程
-        self._play_thread = threading.Thread(target=self._play_loop, daemon=True)
-        self._play_thread.start()
-        self.logger.info("中文离线 TTS 服务已启动")
-
-    def stop(self):
-        """停止服务，清空队列"""
-        if not self._running:
-            return
-        self._running = False
-
-        with self._lock:
+def cleanup(self):
+        with self._state_lock:
             self._audio_queue.clear()
+        with self._op_lock:
+            self._synthesizer = None
 
-        if self._play_thread and self._play_thread.is_alive():
-            self._play_thread.join(timeout=2.0)
+    # ---------------- 进程循环 ----------------
+def tts_loop(self):
+        while True:
+            with self._state_lock:
+                if not self._running:
+                    break
+                text = self._audio_queue.pop(0) if self._audio_queue else None
 
-        self.logger.info("中文离线 TTS 服务已停止")
+            if text is None:
+                time.sleep(0.1)
+                continue
 
-    def speak(self, text: str, wait_finish: bool = False) -> Optional[str]:
-        """
-        合成并播放中文语音
-        :param text: 要说的中文文本
-        :param wait_finish: True=阻塞直到播完，False=后台排队
-        :return: 音频文件路径或 None
-        """
-        if not self._running:
-            self.logger.warning("服务未启动，请先调用 open()")
+            audio_path = self._synthesize(text)
+            if audio_path:
+                self._play_audio(audio_path)
+
+    # ---------------- 状态查询 ----------------
+def is_running(self) -> bool:
+        with self._state_lock:
+            return self._running
+
+def get_pending_count(self) -> int:
+        with self._state_lock:
+            return len(self._audio_queue)
+
+    # ---------------- 业务操作 ----------------
+def speak(self, text: str, wait_finish: bool = False) -> Optional[str]:
+        with self._state_lock:
+            running = self._running
+        if not running or not text or not text.strip():
             return None
 
-        if not text or len(text.strip()) == 0:
-            self.logger.warning("文本为空，跳过")
-            return None
-
-        # 同步模式：立即合成并播放
         if wait_finish:
             audio_path = self._synthesize(text)
-            if audio_path and audio_path != 'error':
+            if audio_path:
                 self._play_audio(audio_path)
                 return audio_path
             return None
 
-        # 异步模式：入队
-        with self._lock:
+        with self._state_lock:
             self._audio_queue.append(text)
-        self.logger.debug(f"已入队: {text[:20]}...")
         return None
 
-    # ------------------------------------------------------------
-    # 内部核心方法
-    # ------------------------------------------------------------
-    def _load_piper_model(self):
-        """加载 Piper 中文模型"""
+    # ---------------- 内部 ----------------
+def _load_piper_model(self):
         try:
             import piper
-
-            # 检查文件是否存在
             if not os.path.exists(self.zh_tts_model):
                 raise FileNotFoundError(f"模型文件不存在: {self.zh_tts_model}")
             if not os.path.exists(self.zh_tts_json):
                 raise FileNotFoundError(f"配置文件不存在: {self.zh_tts_json}")
-
-            self.synthesizer = piper.PiperVoice.load(
-                self.zh_tts_model,
-                config_path=self.zh_tts_json,
-                use_cuda=False  # Jetson 可改为 True
+            self._synthesizer = piper.PiperVoice.load(
+                self.zh_tts_model, config_path=self.zh_tts_json, use_cuda=False
             )
-            self.logger.info(f"Piper 中文模型加载成功")
-
+            self.logger.info("Piper 中文模型加载成功")
         except ImportError:
-            self.logger.error("请安装: pip install piper-tts")
+            self.logger.error("请安装 piper-tts")
             raise
         except Exception as e:
             self.logger.error(f"模型加载失败: {e}")
             raise
 
-    def _synthesize(self, text: str) -> str:
-        """合成中文音频，返回文件路径，失败返回 'error'"""
-        if not self.synthesizer:
-            self.logger.error("引擎未初始化")
-            return 'error'
-
+def _synthesize(self, text: str) -> Optional[str]:
+        with self._op_lock:
+            synth = self._synthesizer
+        if synth is None:
+            return None
         try:
             fd, audio_path = tempfile.mkstemp(suffix=".wav", prefix="tts_")
             os.close(fd)
-
             with wave.open(audio_path, "wb") as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
-                wav.setframerate(self.synthesizer.config.sample_rate)
-                self.synthesizer.synthesize(text, wav)
-
+                wav.setframerate(synth.config.sample_rate)
+                synth.synthesize(text, wav)
             if os.path.getsize(audio_path) > 1000:
                 return audio_path
-            else:
-                os.remove(audio_path)
-                return 'error'
-
+            os.remove(audio_path)
+            return None
         except Exception as e:
             self.logger.error(f"合成失败: {e}")
-            return 'error'
+            return None
 
-    def _play_audio(self, audio_path: str):
-        """播放音频"""
+def _play_audio(self, audio_path: str):
         try:
-          AudioManager.playsound(audio_path)
+            AudioManager.playsound(audio_path)
         except Exception as e:
             self.logger.error(f"播放失败: {e}")
-
-    def _play_loop(self):
-        """后台线程：循环播放"""
-        while self._running:
-            with self._lock:
-                if not self._audio_queue:
-                    text = None
-                else:
-                    text = self._audio_queue.pop(0)
-
-            if text is None:
-                time.sleep(0.2)
-                continue
-
-            audio_path = self._synthesize(text)
-            if audio_path == 'error':
-                continue
-
-            self._play_audio(audio_path)
-
-
-# ------------------------------------------------------------
-# TextToSpeech 对外门面类
-# ------------------------------------------------------------
-class TextToSpeech:
-    """
-    纯中文离线语音合成器
-    用法：
-        cfg = {
-            "zh_tts_model": "/home/user/piper/zh_CN.pth",
-            "zh_tts_json": "/home/user/piper/zh_CN.json",
-        }
-        tts = TextToSpeech(cfg)
-        tts.open()
-        tts.speak("你好，欢迎使用")
-        tts.stop()
-    """
-
-    def __init__(self, cfg: dict = None):
-        if cfg is None:
-            cfg = {}
-        self.logger = logging.getLogger("TextToSpeech")
-        self.impl = _TTSImpl(cfg, self.logger)
-
-    def open(self):
-        self.impl.open()
-
-    def stop(self):
-        self.impl.stop()
-
-    def speak(self, text: str, wait_finish: bool = False) -> Optional[str]:
-        return self.impl.speak(text, wait_finish)

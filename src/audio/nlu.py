@@ -1,12 +1,16 @@
 # nlu.py
 import re
+import threading
 from typing import Dict, List, Tuple
 
 
-class _NLUImpl:
-    """基于正则的意图分类器"""
+class NLUModule:
 
-    def __init__(self, cfg: dict):
+     def __init__(self, cfg: dict = None):
+        if cfg is None:
+            cfg = {}
+        self.cfg = cfg
+
         self.wakeup_words: List[str] = cfg.get("wakeup_words", [
             "你好视觉助手", "视觉助手", "小视", "嗨小视",
             "hey视觉助手", "hey小视", "你好小视"
@@ -41,85 +45,71 @@ class _NLUImpl:
         # 自定义规则（可运行时注入）
         custom_rules: Dict[str, List[str]] = cfg.get("custom_rules", {})
         for intent, patterns in custom_rules.items():
-            self.add_intent(intent, patterns)
-            
-        # 编译正则
-        self._compile_rules()
+           self.intent_rules.append((intent, patterns))
 
-    def _compile_rules(self):
         self._compiled_rules: List[Tuple[str, List[re.Pattern]]] = []
         for intent, patterns in self.intent_rules:
-            compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
-            self._compiled_rules.append((intent, compiled))
+            self._compiled_rules.append(
+                (intent, [re.compile(p, re.IGNORECASE) for p in patterns])
+            )
 
-    def add_intent(self, intent: str, patterns: List[str]):
-        compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
-        self._compiled_rules.append((intent, compiled))
+        self._state_lock = threading.Lock()
+        self._op_lock = threading.Lock()
+        self._running = False
+        
 
-    def open(self):
+     # ---------------- 生命周期 ----------------
+def start(self):
+        with self._state_lock:
+            self._running = True
+
+def shutdown(self):
+        with self._state_lock:
+            self._running = False
+
+def cleanup(self):
         pass
 
-    def stop(self):
-        pass
+    # ---------------- 状态查询 ----------------
+def is_running(self) -> bool:
+        with self._state_lock:
+            return self._running
 
-    def parse(self, text: str) -> Dict:
+    # ---------------- 业务操作 ----------------
+def parse(self, text: str) -> Dict:
         if not text:
             return self._empty_result(text)
-        
-        # 1. 检测唤醒词（只要文本中出现任一个唤醒词，就视为唤醒）
+
         wakeup_hit = any(w in text for w in self.wakeup_words)
-        
-        # 2. 意图匹配（规则按优先级顺序执行）
+
         for intent, patterns in self._compiled_rules:
             for pattern in patterns:
                 match = pattern.search(text)
                 if match:
-                    # 提取捕获组作为参数（可能有多个，但我们取第一个有意义的值）
                     argument = ""
                     for group in match.groups():
                         if group is not None:
                             argument = group.strip().rstrip("吧。？?！! ")
-                            if argument:# 非空就作为参数
+                            if argument:
                                 break
-                    # 如果所有组都是空的，保留整个匹配
                     return {
                         "is_wakeup": wakeup_hit,
                         "intent": intent,
                         "argument": argument,
-                        "raw_text": text
+                        "raw_text": text,
                     }
 
-        # 3. 无匹配，返回 unknown
         return {
             "is_wakeup": wakeup_hit,
             "intent": "unknown",
             "argument": "",
-            "raw_text": text
+            "raw_text": text,
         }
 
-    def _empty_result(self, text: str) -> Dict:
+def _empty_result(self, text: str) -> Dict:
         return {
             "is_wakeup": False,
             "intent": "unknown",
             "argument": "",
-            "raw_text": text
+            "raw_text": text,
         }
-
-
-# NLU 对外顶层类
-class NLU:
-    """自然语言理解器，对外提供 open/stop/parse"""
-
-    def __init__(self, cfg: dict = None):
-        if cfg is None:
-            cfg = {}
-        self.impl = _NLUImpl(cfg)
-
-    def open(self):
-        self.impl.open()
-
-    def stop(self):
-        self.impl.stop()
-
-    def parse(self, text: str) -> Dict:
-        return self.impl.parse(text)

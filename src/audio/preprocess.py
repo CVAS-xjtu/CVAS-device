@@ -1,7 +1,7 @@
 # denoiser.py
-# denoiser.py
 import numpy as np
 from typing import Optional
+import threading
 
 # ------------------------------------------------------------
 # 谱减法核心算法
@@ -10,7 +10,8 @@ from typing import Optional
 class SpectralSubtractionDenoiser:
     """基于幅度谱减法的语音降噪核心"""
 
-    def __init__(self,
+    def __init__(
+                 self,
                  sample_rate: int = 16000,
                  frame_length_ms: float = 25.0,
                  frame_shift_ms: float = 10.0,
@@ -86,31 +87,59 @@ class SpectralSubtractionDenoiser:
         return out
 
 
-class Denoiser:
-    """降噪器顶层类，提供 open/stop/process 接口"""
+class PreprocessModule:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self._state_lock = threading.Lock()
+        self._op_lock = threading.Lock()
+        self._running = False
+        self._enabled = cfg.get("enable", False)
+        self._denoiser: Optional[SpectralSubtractionDenoiser] = None
 
-    def __init__(self, cfg: dict = None):
-        if cfg is None:
-            cfg = {}
-        self.denoiser = SpectralSubtractionDenoiser(
-            sample_rate=cfg.get("sample_rate", 16000),
-            frame_length_ms=cfg.get("frame_length_ms", 25.0),
-            frame_shift_ms=cfg.get("frame_shift_ms", 10.0),
-            noise_frames=cfg.get("noise_frames", 10),
-            over_subtraction_factor=cfg.get("over_subtraction_factor", 2.0),
-            spectral_floor=cfg.get("spectral_floor", 0.01),
-        )
-        self._opened = False
+    # ---------------- 生命周期 ----------------
+    def start(self):
+        if self._enabled:
+            with self._op_lock:
+                self._denoiser = SpectralSubtractionDenoiser(
+                    sample_rate=self.cfg.get("sample_rate", 16000),
+                    frame_length_ms=self.cfg.get("frame_length_ms", 25.0),
+                    frame_shift_ms=self.cfg.get("frame_shift_ms", 10.0),
+                    noise_frames=self.cfg.get("noise_frames", 10),
+                    over_subtraction_factor=self.cfg.get("over_subtraction_factor", 2.0),
+                    spectral_floor=self.cfg.get("spectral_floor", 0.01),
+                )
+        with self._state_lock:
+            self._running = True
 
-    def open(self, noise_audio: np.ndarray = None):
-        if noise_audio is not None:
-            self.denoiser.estimate_noise(noise_audio)
-        self._opened = True
+    def shutdown(self):
+        with self._state_lock:
+            self._running = False
 
-    def stop(self):
-        self._opened = False
+    def cleanup(self):
+        with self._op_lock:
+            self._denoiser = None
 
-    def process(self, audio: np.ndarray) -> np.ndarray:
-        if not self._opened:
-            self.open()  # 自动启动并利用默认噪声估计
-        return self.denoiser.process_array(audio)
+    # ---------------- 状态查询 ----------------
+    def is_running(self) -> bool:
+        with self._state_lock:
+            return self._running
+
+    def is_enabled(self) -> bool:
+        with self._state_lock:
+            return self._enabled
+
+    # ---------------- 业务操作 ----------------
+    def process_file(self, path: str) -> bool:
+        with self._op_lock:
+            denoiser = self._denoiser
+            enabled = self._enabled
+        if not enabled or denoiser is None:
+            return False
+        try:
+            import soundfile as sf
+            audio, sr = sf.read(path)
+            audio = denoiser.process_array(audio)
+            sf.write(path, audio, sr)
+            return True
+        except Exception:
+            return False

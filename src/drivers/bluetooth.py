@@ -8,6 +8,7 @@ import re
 
 class BluetoothManager:
     def __init__(self, audio_cfg: dict):
+        self.cfg = self.cfg
         # 配置字典
         self._audio_cfg = audio_cfg
         # 蓝牙MAC地址
@@ -26,6 +27,8 @@ class BluetoothManager:
         self._cmd_timeout = self._audio_cfg.get("cmd_timeout_sec", 0.5)
         # 蓝牙管理器线程join超时时间
         self._thread_join_timeout = self._audio_cfg.get("thread_join_timeout_sec", 1.0)
+
+        # 配置参数边界检查
 
         if self._thread_sleep <= 0:
             self._thread_sleep = 0.5
