@@ -4,9 +4,7 @@ import os
 import glob
 import subprocess
 from typing import Optional, Callable
-from drivers import button
-from drivers import AudioManager
-from audio import asr
+
 
 
 class PTTModule:
@@ -16,10 +14,12 @@ class PTTModule:
         cfg: dict,
         asr,
         audio_manager_factory: Callable,
+        button
     ):
         self.cfg = cfg
         self.asr = asr
         self.audio_manager_factory = audio_manager_factory
+        self.button = button
 
         self.device_name = cfg.get("device_name", "")
         self.record_file_base = cfg.get("record_file_base", "/tmp/record_voice")
@@ -127,7 +127,7 @@ class PTTModule:
                     break
 
             # 锁外调用 button 驱动
-            current = button.is_pressed()
+            current = self.button.is_pressed()
 
             if current and not last_state:
                 self._start_recording()
