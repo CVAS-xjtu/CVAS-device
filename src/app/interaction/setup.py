@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'pointcloud_viewer'
+package_name = 'interaction'
 
 setup(
     name=package_name,
@@ -14,7 +14,7 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='lhc',
-    maintainer_email='lhc@todo.todo',
+    maintainer_email='2056524536@qq.com',
     description='TODO: Package description',
     license='Apache-2.0',
     extras_require={
@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'interaction = interaction.interaction:main'
         ],
     },
 )
