@@ -32,10 +32,6 @@ class _KwsModelStub:
 
 class _AsrModelStub:
     """占位 ASR 模型接口：需实现 online_asr / SenseVoiceSmall_ASR"""
-    def online_asr(self, path):
-        # TODO: 替换为真实在线 ASR
-        return ("ok", "在线识别测试文本")
-
     def SenseVoiceSmall_ASR(self, path):
         # TODO: 替换为真实离线模型
         return ("ok", "离线识别测试文本")
