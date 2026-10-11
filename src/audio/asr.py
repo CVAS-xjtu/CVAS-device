@@ -1,7 +1,6 @@
 # asr.py
 import time
 import threading
-import numpy as np
 from typing import Optional
 
 

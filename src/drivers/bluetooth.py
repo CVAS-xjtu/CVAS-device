@@ -88,6 +88,7 @@ class BluetoothModule:
             self._connected = False
             self._battery_level = None
             self._auto_reconnect = True
+        with self._buf_lock:
             self._bt_output_buf = ""
 
     # ==================== 进程循环 ====================
