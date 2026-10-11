@@ -3,16 +3,15 @@ import time
 import threading
 import numpy as np
 from typing import Optional
-from audio import wakeup
-from audio import preprocess
+
 
 
 class ASRModule:
 
-    def __init__(self, cfg: dict, model_interface):
+    def __init__(self, cfg: dict, model_interface, kws, preprocess):
         self.cfg = cfg
         self.model_interface = model_interface
-        self.wakeup = wakeup          # 注入
+        self.kws = kws       # 注入
         self.preprocess = preprocess  # 注入
         self.use_online_asr = cfg.get("use_online_asr", False)
 

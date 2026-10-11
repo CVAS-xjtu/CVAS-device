@@ -1,320 +1,549 @@
-import time
+# interaction_node.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String, Bool
 import threading
-import os
-import glob
-import subprocess
-from typing import Optional, Callable
+import time
+import json
+from typing import Optional
+
+from interaction.kws import KWSModule
+from interaction.ptt import PTTModule
+from drivers.bluetooth import BluetoothModule
+from drivers.audio import AudioModule
+from drivers.button import ButtonModule
+from audio.wakeup import EnergyVAD
+from audio.preprocess import PreprocessModule
+from audio.asr import ASRModule
+from audio.nlu import NLUModule
+from audio.tts import TTSModule
 
 
+# ================================================================
+#   模块级 Stub（避免每次创建内嵌类）
+# ================================================================
+class _KwsModelStub:
+    """占位 KWS 模型：需实现 detect(frame_bytes) -> str|None"""
+    def detect(self, frame_bytes: bytes) -> Optional[str]:
+        # TODO: 替换为真实 KWS 模型
+        return None
 
-class PTTModule:
 
-    def __init__(
-        self,
-        cfg: dict,
-        asr,
-        audio_manager_factory: Callable,
-        button
-    ):
+class _AsrModelStub:
+    """占位 ASR 模型接口：需实现 online_asr / SenseVoiceSmall_ASR"""
+    def online_asr(self, path):
+        # TODO: 替换为真实在线 ASR
+        return ("ok", "在线识别测试文本")
+
+    def SenseVoiceSmall_ASR(self, path):
+        # TODO: 替换为真实离线模型
+        return ("ok", "离线识别测试文本")
+
+
+# ================================================================
+#   InteractionNode
+# ================================================================
+class InteractionNode(Node):
+    """
+    ROS2 interaction 节点：唯一组合根
+      - 统一创建所有模块实例
+      - 统一创建所有线程
+      - 统一管理生命周期（start / shutdown / cleanup）
+      - KWS 常开监听；检测到关键词后自己录音，放入音频队列
+      - ASR 从 KWS 队列取音频做识别
+      - PTT 按键触发录音 + 识别，结果并入 ASR 结果队列
+      - NLU 解析 ASR 文本为意图
+      - TTS 播报反馈；播放期间暂停 KWS，避免自触发
+    """
+
+    TTS_COOLDOWN_SEC = 0.5
+
+    def __init__(self):
+        super().__init__("interaction_node")
+
+        # ---------------- 参数声明 ----------------
+        # 音频
+        self.declare_parameter("sample_rate", 16000)
+        self.declare_parameter("mic_index", 0)
+        self.declare_parameter("frame_duration_ms", 30)
+        self.declare_parameter("max_silence_frames", 90)
+        self.declare_parameter("vad_threshold", 500)
+        self.declare_parameter("record_timeout", 8.0)
+
+        # 蓝牙
+        self.declare_parameter("bt_target_mac", "")
+
+        # 按键
+        self.declare_parameter("button_pin", 17)
+        self.declare_parameter("button_pull_up", True)
+        self.declare_parameter("button_debounce_ms", 50)
+        self.declare_parameter("button_poll_interval_ms", 10)
+
+        # PTT
+        self.declare_parameter("ptt_record_file_base", "/tmp/record_voice")
+        self.declare_parameter("ptt_a2dp_profile", "a2dp_sink")
+        self.declare_parameter("ptt_hsp_profile", "headset_head_unit")
+        self.declare_parameter("ptt_auto_switch_profile", True)
+        self.declare_parameter("ptt_max_keep_files", 5)
+        self.declare_parameter("ptt_poll_interval", 0.02)
+        self.declare_parameter("ptt_record_max_duration", 600)
+
+        # KWS
+        self.declare_parameter("keywords", [])
+
+        # ASR
+        self.declare_parameter("enable_denoiser", False)
+        self.declare_parameter("use_online_asr", False)
+
+        # NLU
+        self.declare_parameter("nlu_wakeup_words", [])
+        # 注意：ROS2 参数不支持嵌套 dict，custom_rules 需以 JSON 字符串传入
+        self.declare_parameter("nlu_custom_rules", "")
+
+        # TTS
+        self.declare_parameter("enable_tts", False)
+        self.declare_parameter("tts_model", "")
+        self.declare_parameter("tts_json", "")
+        self.declare_parameter("tts_use_audio_module", True)
+
+        cfg = {
+            "sample_rate": self.get_parameter("sample_rate").value,
+            "mic_index": self.get_parameter("mic_index").value,
+            "frame_duration_ms": self.get_parameter("frame_duration_ms").value,
+            "max_silence_frames": self.get_parameter("max_silence_frames").value,
+            "vad_threshold": self.get_parameter("vad_threshold").value,
+            "record_timeout": self.get_parameter("record_timeout").value,
+
+            "bt_target_mac": self.get_parameter("bt_target_mac").value,
+
+            "button_pin": self.get_parameter("button_pin").value,
+            "button_pull_up": self.get_parameter("button_pull_up").value,
+            "button_debounce_ms": self.get_parameter("button_debounce_ms").value,
+            "button_poll_interval_ms": self.get_parameter("button_poll_interval_ms").value,
+
+            "ptt_record_file_base": self.get_parameter("ptt_record_file_base").value,
+            "ptt_a2dp_profile": self.get_parameter("ptt_a2dp_profile").value,
+            "ptt_hsp_profile": self.get_parameter("ptt_hsp_profile").value,
+            "ptt_auto_switch_profile": self.get_parameter("ptt_auto_switch_profile").value,
+            "ptt_max_keep_files": self.get_parameter("ptt_max_keep_files").value,
+            "ptt_poll_interval": self.get_parameter("ptt_poll_interval").value,
+            "ptt_record_max_duration": self.get_parameter("ptt_record_max_duration").value,
+
+            "keywords": list(self.get_parameter("keywords").value),
+
+            "enable_denoiser": self.get_parameter("enable_denoiser").value,
+            "use_online_asr": self.get_parameter("use_online_asr").value,
+
+            "nlu_wakeup_words": list(self.get_parameter("nlu_wakeup_words").value),
+            "nlu_custom_rules": self.get_parameter("nlu_custom_rules").value,
+
+            "enable_tts": self.get_parameter("enable_tts").value,
+            "tts_model": self.get_parameter("tts_model").value,
+            "tts_json": self.get_parameter("tts_json").value,
+            "tts_use_audio_module": self.get_parameter("tts_use_audio_module").value,
+        }
         self.cfg = cfg
-        self.asr = asr
-        self.audio_manager_factory = audio_manager_factory
-        self.button = button
 
-        self.device_name = cfg.get("device_name", "")
-        self.record_file_base = cfg.get("record_file_base", "/tmp/record_voice")
-        self.a2dp_profile = cfg.get("a2dp_profile", "a2dp_sink")
-        self.hsp_profile = cfg.get("hsp_profile", "headset_head_unit")
-        self.auto_switch_profile = cfg.get("auto_switch_profile", True)
-        self.max_keep_files = cfg.get("max_keep_files", 5)
-        self.poll_interval = cfg.get("poll_interval", 0.02)
+        # ---------------- ROS 发布器 ----------------
+        self.text_pub = self.create_publisher(String, "/interaction/asr_text", 10)
+        self.wakeup_pub = self.create_publisher(Bool, "/interaction/wakeup", 10)
+        self.intent_pub = self.create_publisher(String, "/interaction/intent", 10)
+        self.status_pub = self.create_publisher(String, "/interaction/status", 10)
 
-         # 锁
+        # ---------------- 节点状态 ----------------
         self._state_lock = threading.Lock()
-        self._op_lock = threading.Lock()
-
-        # 状态
+        self._threads_lock = threading.Lock()
         self._running = False
-        self._key_pressed = False
-        self._is_recording = False
+        self._last_tts_end_time = 0.0
 
-        # 硬件 / 子进程
-        self._audio_manager = None
-        self._current_mac: Optional[str] = None
-        self._recording_proc = None
-        self._current_record_file: Optional[str] = None
+        # ---------------- 创建模块（依赖注入） ----------------
+        self._create_modules(cfg)
 
+        # 模块列表：start 顺序，cleanup 逆序
+        self.modules = [
+            self.bluetooth,
+            self.audio,
+            self.button,
+            self.preprocess,
+            self.kws,
+            self.asr,
+            self.nlu,
+        ]
+        if self.tts is not None:
+            self.modules.append(self.tts)
+        self.modules.append(self.ptt)
 
-       # ==================== 生命周期 ====================
+        # 循环注册：模块 + 循环方法
+        self.loops = [
+            (self.bluetooth, self.bluetooth.stdout_loop),
+            (self.bluetooth, self.bluetooth.stderr_loop),
+            (self.bluetooth, self.bluetooth.reconnect_loop),
+            (self.audio, self.audio.audio_loop),
+            (self.button, self.button.button_loop),
+            (self.kws, self.kws.kws_loop),
+            (self.asr, self.asr.asr_loop),
+        ]
+        if self.tts is not None:
+            self.loops.append((self.tts, self.tts.tts_loop))
+        self.loops.append((self.ptt, self.ptt.ptt_loop))
+
+        self._threads = []
+
+        # ---------------- ROS 定时器 ----------------
+        self.timer = self.create_timer(0.1, self._poll_results)
+
+        self.get_logger().info(
+            f"Interaction node initialized "
+            f"(TTS={'on' if self.tts else 'off'}, "
+            f"modules={len(self.modules)}, loops={len(self.loops)})"
+        )
+
+    # ================================================================
+    #   创建模块
+    # ================================================================
+    def _create_modules(self, cfg):
+        # 1. 蓝牙
+        self.bluetooth = BluetoothModule({
+            "target_mac": cfg["bt_target_mac"],
+        })
+
+        # 2. 音频（依赖 bluetooth）
+        self.audio = AudioModule(
+            cfg={},
+            bt_manager=self.bluetooth,
+        )
+
+        # 3. 按键
+        self.button = ButtonModule({
+            "pin": cfg["button_pin"],
+            "pull_up": cfg["button_pull_up"],
+            "debounce_ms": cfg["button_debounce_ms"],
+            "poll_interval_ms": cfg["button_poll_interval_ms"],
+        })
+
+        # 4. VAD
+        self.vad = EnergyVAD(threshold=cfg["vad_threshold"])
+
+        # 5. 降噪
+        self.preprocess = PreprocessModule({
+            "enable": cfg["enable_denoiser"],
+            "sample_rate": cfg["sample_rate"],
+        })
+
+        # 6. KWS（依赖 vad）
+        self.kws = KWSModule(
+            cfg={
+                "sample_rate": cfg["sample_rate"],
+                "mic_index": cfg["mic_index"],
+                "frame_duration_ms": cfg["frame_duration_ms"],
+                "max_silence_frames": cfg["max_silence_frames"],
+                "keywords": cfg["keywords"],
+                "kws_model": _KwsModelStub(),
+                "audio_path": "/tmp/interaction_kws_utterance.wav",
+                "record_timeout": cfg["record_timeout"],
+            },
+            vad=self.vad,
+        )
+
+        # 7. ASR（依赖 kws + preprocess）
+        self.asr = ASRModule(
+            cfg={"use_online_asr": cfg["use_online_asr"]},
+            model_interface=_AsrModelStub(),
+            kws=self.kws,
+            preprocess=self.preprocess,
+        )
+
+        # 8. NLU
+        self.nlu = NLUModule({
+            "wakeup_words": cfg["nlu_wakeup_words"],
+            "custom_rules": self._parse_custom_rules(cfg["nlu_custom_rules"]),
+        })
+
+        # 9. TTS（可选，依赖 audio 作为播放通道）
+        self.tts = None
+        if cfg["enable_tts"] and cfg["tts_model"] and cfg["tts_json"]:
+            self.tts = TTSModule(
+                cfg={
+                    "zh_tts_model": cfg["tts_model"],
+                    "zh_tts_json": cfg["tts_json"],
+                },
+                logger=self.get_logger(),
+                audio_manager=self.audio,
+            )
+
+        # 10. PTT（依赖 asr + audio + button）
+        self.ptt = PTTModule(
+            cfg={
+                "record_file_base": cfg["ptt_record_file_base"],
+                "a2dp_profile": cfg["ptt_a2dp_profile"],
+                "hsp_profile": cfg["ptt_hsp_profile"],
+                "auto_switch_profile": cfg["ptt_auto_switch_profile"],
+                "max_keep_files": cfg["ptt_max_keep_files"],
+                "poll_interval": cfg["ptt_poll_interval"],
+                "record_max_duration": cfg["ptt_record_max_duration"],
+            },
+            asr=self.asr,
+            audio=self.audio,
+            button=self.button,
+        )
+
+    def _parse_custom_rules(self, raw) -> dict:
+        """ROS2 参数不能是嵌套 dict，用 JSON 字符串传"""
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+
+    # ================================================================
+    #   生命周期
+    # ================================================================
     def start(self):
-        # 1. 找到 MAC，创建 AudioManager
-        mac = self._find_mac()
-        if not mac:
-            raise RuntimeError(f"未找到蓝牙设备（名称包含：{self.device_name}）")
-
-        with self._op_lock:
-            self._current_mac = mac
-            self._audio_manager = self.audio_manager_factory(mac)
-            am = self._audio_manager
-
-        # 2. 锁外调用 am 的接口
-        if self.auto_switch_profile:
+        # 1. 启动所有模块（记录失败的模块）
+        failed_modules = set()
+        for m in self.modules:
             try:
-                am.set_profile(self.hsp_profile)
-                time.sleep(0.2)
-                if not am.wait_until_ready(timeout=3, require_mic=True):
-                    raise RuntimeError("麦克风设备未就绪")
-                am.set_profile(self.a2dp_profile)
-                time.sleep(0.2)
+                m.start()
             except Exception as e:
-                # 尝试重新获取 MAC
-                new_mac = self._find_mac()
-                if new_mac and new_mac != mac:
-                    with self._op_lock:
-                        old_am = self._audio_manager
-                        self._current_mac = new_mac
-                        self._audio_manager = self.audio_manager_factory(new_mac)
-                        am = self._audio_manager
-                    if old_am:
-                        try:
-                            old_am.stop()
-                        except Exception:
-                            pass
-                    am.set_profile(self.hsp_profile)
-                    time.sleep(0.2)
-                    if not am.wait_until_ready(timeout=3, require_mic=True):
-                        raise RuntimeError("重试后麦克风仍不可用")
-                    am.set_profile(self.a2dp_profile)
-                    time.sleep(0.2)
-                else:
-                    raise RuntimeError(f"初始化设备失败: {e}")
+                self.get_logger().error(
+                    f"Module {m.__class__.__name__} start failed: {e}"
+                )
+                failed_modules.add(m)
+
+        # 2. 只对启动成功的模块创建 loop 线程
+        for module, loop_func in self.loops:
+            if module in failed_modules:
+                continue
+            t = threading.Thread(
+                target=loop_func,
+                name=f"{module.__class__.__name__}_{loop_func.__name__}",
+                daemon=True,
+            )
+            t.start()
+            with self._threads_lock:
+                self._threads.append(t)
+
+        # 3. 打开麦克风，KWS 常开监听
+        try:
+            self.kws.activate()
+        except Exception as e:
+            self.get_logger().error(f"KWS activate failed: {e}")
+        if hasattr(self.kws, "is_active") and not self.kws.is_active():
+            self.get_logger().error("KWS mic activation failed")
 
         with self._state_lock:
             self._running = True
 
+        self._publish_status({"event": "started"})
+        self.get_logger().info("Interaction node started")
+
     def shutdown(self):
         with self._state_lock:
             self._running = False
-            was_recording = self._is_recording
-        # 如果在录音，需要主动停止并识别
-        if was_recording:
-            self._stop_recording_and_recognize()
+
+        # 先关闭麦克风
+        try:
+            self.kws.deactivate()
+        except Exception as e:
+            self.get_logger().error(f"KWS deactivate failed: {e}")
+
+        # 终止当前音频操作（让阻塞的 paplay/parecord 退出）
+        try:
+            self.audio.stop_audio()
+        except Exception as e:
+            self.get_logger().error(f"audio stop failed: {e}")
+
+        # 通知所有模块停止循环
+        for m in self.modules:
+            try:
+                m.shutdown()
+            except Exception as e:
+                self.get_logger().error(
+                    f"Module {m.__class__.__name__} shutdown failed: {e}"
+                )
+
+        self._publish_status({"event": "shutdown"})
+        self.get_logger().info("Interaction node shutdown")
 
     def cleanup(self):
-        with self._op_lock:
-            am = self._audio_manager
-            self._audio_manager = None
-            proc = self._recording_proc
-            self._recording_proc = None
-
-        if proc is not None:
+        # 1. 逆序 cleanup：关硬件、关子进程（让阻塞 IO 退出）
+        for m in reversed(self.modules):
             try:
-                proc.wait(timeout=1)
-            except Exception:
-                pass
-        if am is not None:
-            try:
-                am.stop()
-            except Exception:
-                pass
+                m.cleanup()
+            except Exception as e:
+                self.get_logger().error(
+                    f"Module {m.__class__.__name__} cleanup failed: {e}"
+                )
 
-    # ==================== 进程循环 ====================
-    def ptt_loop(self):
-        last_state = False
-        while True:
-            with self._state_lock:
-                if not self._running:
-                    break
+        # 2. 等所有线程退出
+        with self._threads_lock:
+            threads = list(self._threads)
+            self._threads.clear()
+        for t in threads:
+            t.join(timeout=2.0)
 
-            # 锁外调用 button 驱动
-            current = self.button.is_pressed()
+        self.get_logger().info("Interaction node cleaned up")
 
-            if current and not last_state:
-                self._start_recording()
-            elif not current and last_state:
-                self._stop_recording_and_recognize()
-
-            last_state = current
-            time.sleep(self.poll_interval)
-
-    # ==================== 状态查询 ====================
+    # ================================================================
+    #   状态查询
+    # ================================================================
     def is_running(self) -> bool:
         with self._state_lock:
             return self._running
 
-    def is_pressed(self) -> bool:
-        with self._state_lock:
-            return self._key_pressed
-
-    def is_recording(self) -> bool:
-        with self._state_lock:
-            return self._is_recording
-
-    # ==================== 业务操作 ====================
-    def _find_mac(self) -> Optional[str]:
-        try:
-            output = subprocess.check_output(
-                ["bluetoothctl", "paired-devices"],
-                text=True, stderr=subprocess.DEVNULL,
-            )
-            for line in output.splitlines():
-                parts = line.split(" ", 2)
-                if len(parts) >= 3:
-                    mac, name = parts[1], parts[2]
-                    if self.device_name.lower() in name.lower():
-                        return mac
-        except Exception:
-            pass
-        return None
-
-    def _refresh_device_if_needed(self) -> bool:
-        new_mac = self._find_mac()
-        if not new_mac:
-            return False
-
-        with self._op_lock:
-            old_am = self._audio_manager
-            self._current_mac = new_mac
-            self._audio_manager = self.audio_manager_factory(new_mac)
-            am = self._audio_manager
-
-        if old_am is not None:
+    # ================================================================
+    #   ROS 定时器：轮询唤醒、ASR、TTS 状态
+    # ================================================================
+    def _poll_results(self):
+        if not self.is_running():
+            return
+        for fn in (
+            self._poll_wakeup_event,
+            self._poll_asr_result,
+            self._poll_tts_state,
+        ):
             try:
-                old_am.stop()
-            except Exception:
-                pass
+                fn()
+            except Exception as e:
+                self.get_logger().error(f"{fn.__name__} failed: {e}")
 
-        try:
-            am.set_profile(self.hsp_profile)
-            time.sleep(0.2)
-            if am.wait_until_ready(timeout=2, require_mic=True):
-                am.set_profile(self.a2dp_profile)
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _cleanup_old_files(self):
-        try:
-            dirname = os.path.dirname(self.record_file_base)
-            basename = os.path.basename(self.record_file_base)
-            files = glob.glob(os.path.join(dirname, f"{basename}_*.wav"))
-            if len(files) <= self.max_keep_files:
-                return
-            files.sort(key=os.path.getmtime)
-            for f in files[:-self.max_keep_files]:
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _start_recording(self):
-        with self._state_lock:
-            if self._is_recording:
-                return
-            self._is_recording = True
-            self._key_pressed = True
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            self._current_record_file = f"{self.record_file_base}_{timestamp}.wav"
-
-        with self._op_lock:
-            am = self._audio_manager
-        if am is None:
-            with self._state_lock:
-                self._is_recording = False
-                self._key_pressed = False
+    def _poll_wakeup_event(self):
+        if not self.kws.is_keyword_detected():
             return
 
-        # 停止当前播放（锁外）
-        try:
-            if am.get_audio_state() == "playing":
-                am.stop_audio()
-                time.sleep(0.1)
-        except Exception:
-            pass
+        keyword = self.kws.get_detected_keyword()
+        self.kws.clear_detection()
 
-        # 切换至 HSP
-        if self.auto_switch_profile:
-            try:
-                am.set_profile(self.hsp_profile)
-                time.sleep(0.2)
-            except Exception:
-                if not self._refresh_device_if_needed():
-                    with self._state_lock:
-                        self._is_recording = False
-                        self._key_pressed = False
-                    return
-                with self._op_lock:
-                    am = self._audio_manager
-                try:
-                    am.set_profile(self.hsp_profile)
-                    time.sleep(0.2)
-                except Exception:
-                    with self._state_lock:
-                        self._is_recording = False
-                        self._key_pressed = False
-                    return
+        msg = Bool()
+        msg.data = True
+        self.wakeup_pub.publish(msg)
 
-        # 启动录音（锁外调用 am 的接口）
-        with self._state_lock:
-            file_path = self._current_record_file
-        try:
-            proc = am.record_file(file_path, duration=600, wait=False)
-            with self._op_lock:
-                self._recording_proc = proc
-        except Exception:
-            with self._state_lock:
-                self._is_recording = False
-                self._key_pressed = False
+        self._publish_status({
+            "event": "wakeup",
+            "keyword": keyword,
+            "timestamp": time.time(),
+        })
+        self.get_logger().info(f"Wakeup detected: {keyword}")
 
-    def _stop_recording_and_recognize(self):
-        with self._state_lock:
-            if not self._is_recording:
-                return
-            self._is_recording = False
-            self._key_pressed = False
-            file_path = self._current_record_file
-            self._current_record_file = None
-
-        with self._op_lock:
-            am = self._audio_manager
-            proc = self._recording_proc
-            self._recording_proc = None
-
-        # 停止录音（锁外）
-        if am is not None:
-            try:
-                am.stop_audio()
-            except Exception:
-                pass
-        if proc is not None:
-            try:
-                proc.wait(timeout=1)
-            except Exception:
-                pass
-
-        # 切回 A2DP
-        if self.auto_switch_profile and am is not None:
-            try:
-                am.set_profile(self.a2dp_profile)
-            except Exception:
-                pass
-
-        # 文件检查
-        if not file_path or not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except Exception:
-                    pass
-            self._cleanup_old_files()
+    def _poll_asr_result(self):
+        text = self.asr.get_result()
+        if not text:
             return
 
-        # 锁外调用 ASR 业务方法
-        text = self.asr.transcribe_file(file_path)
-        if text:
-            self.asr.push_result(text)
+        # 1. 发布 ASR 文本
+        msg = String()
+        msg.data = text
+        self.text_pub.publish(msg)
 
-        self._cleanup_old_files()
+        self._publish_status({
+            "event": "asr",
+            "text": text,
+            "timestamp": time.time(),
+        })
+        self.get_logger().info(f"ASR: {text}")
+
+        # 2. NLU 解析
+        nlu_result = self.nlu.parse(text)
+        self._publish_status({
+            "event": "nlu",
+            "result": nlu_result,
+            "timestamp": time.time(),
+        })
+        self.get_logger().info(f"NLU: {nlu_result}")
+
+        # 3. 分发到业务
+        self._dispatch(nlu_result)
+
+    def _poll_tts_state(self):
+        """TTS 播放期间暂停 KWS，播放结束后冷却一段时间再恢复"""
+        if self.tts is None:
+            return
+
+        busy = self.tts.is_busy()
+        now = time.time()
+
+        if busy:
+            self._last_tts_end_time = now
+            if not self.kws.is_paused():
+                self.kws.pause()
+                self.get_logger().debug("KWS paused (TTS busy)")
+        else:
+            if self.kws.is_paused() and (now - self._last_tts_end_time) > self.TTS_COOLDOWN_SEC:
+                self.kws.resume()
+                self.get_logger().debug("KWS resumed (TTS idle)")
+
+    # ================================================================
+    #   意图分发
+    # ================================================================
+    def _dispatch(self, nlu_result: dict):
+        intent = nlu_result.get("intent", "unknown")
+        argument = nlu_result.get("argument", "")
+
+        # 发布意图到 ROS
+        intent_msg = String()
+        intent_msg.data = json.dumps(nlu_result, ensure_ascii=False)
+        self.intent_pub.publish(intent_msg)
+
+        # stop 意图：真正关闭节点
+        if intent == "stop":
+            self.get_logger().info("Stop intent received, shutting down node")
+            threading.Thread(target=self.shutdown, daemon=True).start()
+            return
+
+        # 其余意图：生成反馈文本
+        if intent == "navigate":
+            response = f"正在为您导航到{argument}" if argument else "请告诉我目的地"
+        elif intent == "describe_scene":
+            response = "正在为您描述场景"
+        elif intent == "read_text":
+            response = "正在为您朗读"
+        else:
+            response = "抱歉，我没有听懂"
+
+        self._speak(response)
+
+    def _speak(self, text: str):
+        if self.tts is None:
+            return
+        # 主动暂停 KWS，消除轮询间隙（避免 TTS 起始音被拾到）
+        self.kws.pause()
+        self._last_tts_end_time = time.time()
+        try:
+            self.tts.speak(text, wait_finish=False)
+        except Exception as e:
+            self.get_logger().error(f"TTS speak failed: {e}")
+            # 异常时立即恢复，避免 KWS 永久暂停
+            self.kws.resume()
+
+    # ================================================================
+    #   状态发布辅助
+    # ================================================================
+    def _publish_status(self, status: dict):
+        msg = String()
+        msg.data = json.dumps(status, ensure_ascii=False)
+        self.status_pub.publish(msg)
+
+
+# ================================================================
+#   主函数
+# ================================================================
+def main(args=None):
+    rclpy.init(args=args)
+    node = InteractionNode()
+    try:
+        node.start()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.shutdown()
+        node.cleanup()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,26 +1,36 @@
+# audio.py
 import subprocess
 import time
 import threading
 from typing import Optional, Tuple, Literal
 
 
-class AudioManager:
-   
+class AudioModule:
+    """
+    蓝牙音频模块：
+      - 注入 BluetoothModule
+      - 不创建线程，由节点创建 audio_loop
+      - 生命周期 start / shutdown / cleanup
+      - 播放/录音通过 paplay / parecord 子进程完成
+    """
+
     def __init__(self, cfg: dict, bt_manager):
         self.cfg = cfg
         self.bt_manager = bt_manager
-        
+
+        # 状态
         self._audio_state: Literal["idle", "playing", "recording"] = "idle"
         self._active_process: Optional[subprocess.Popen] = None
+        self._sink_name: Optional[str] = None
+        self._source_name: Optional[str] = None
 
-      #锁
-        self._state_lock = threading.Lock()
-        self._op_lock = threading.Lock()
+        # 锁
+        self._state_lock = threading.Lock()   # 保护状态：_audio_state/_active_process/_sink_name/_source_name/_running
+        self._op_lock = threading.Lock()      # 保护子进程操作：Popen/terminate/设备查询
 
         self._running = False
 
-
-    # ---------------- 生命周期 ----------------
+    # ==================== 生命周期 ====================
     def start(self):
         self._update_device_names()
         with self._state_lock:
@@ -31,18 +41,20 @@ class AudioManager:
             self._running = False
 
     def cleanup(self):
+        # 先停当前操作
         self.stop_audio()
         with self._state_lock:
             self._sink_name = None
             self._source_name = None
 
-    # ---------------- 进程循环 ----------------
+    # ==================== 进程循环 ====================
     def audio_loop(self):
         while True:
             with self._state_lock:
                 if not self._running:
                     break
                 proc = self._active_process
+
             if proc is not None and proc.poll() is not None:
                 with self._state_lock:
                     if self._active_process is proc:
@@ -50,7 +62,7 @@ class AudioManager:
                         self._active_process = None
             time.sleep(0.1)
 
-    # ---------------- 状态查询 ----------------
+    # ==================== 状态查询 ====================
     def is_running(self) -> bool:
         with self._state_lock:
             return self._running
@@ -80,6 +92,14 @@ class AudioManager:
     def is_idle(self) -> bool:
         return self.get_audio_state() == "idle"
 
+    def is_playing(self) -> bool:
+        with self._state_lock:
+            return self._audio_state == "playing"
+
+    def is_recording(self) -> bool:
+        with self._state_lock:
+            return self._audio_state == "recording"
+
     def get_device_names(self, force_refresh: bool = False) -> Tuple[Optional[str], Optional[str]]:
         if force_refresh:
             self._update_device_names()
@@ -90,7 +110,7 @@ class AudioManager:
         with self._state_lock:
             return self._audio_state
 
-    # ---------------- 业务操作 ----------------
+    # ==================== 业务操作 ====================
     def wait_until_ready(self, timeout: float = 10.0,
                          check_interval: float = 0.5,
                          require_mic: bool = False) -> bool:
@@ -130,6 +150,7 @@ class AudioManager:
                 )
             except Exception as e:
                 raise RuntimeError(f"切换配置文件失败: {e}")
+        # 锁外刷新
         self._update_device_names()
 
     def play_file(self, file_path: str, wait: bool = True) -> Optional[subprocess.Popen]:
@@ -153,19 +174,27 @@ class AudioManager:
         return self._start_operation("recording", cmd, wait)
 
     def stop_audio(self):
-        with self._state_lock:
-            proc = self._active_process
-        if proc is not None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                pass
-        with self._state_lock:
-            self._audio_state = "idle"
-            self._active_process = None
+        """
+        立即终止当前播放或录音，并重置状态。
+        用 _op_lock 串行化，避免与 _start_operation 竞争。
+        """
+        with self._op_lock:
+            with self._state_lock:
+                proc = self._active_process
+                self._audio_state = "idle"
+                self._active_process = None
 
-    # ---------------- 内部 ----------------
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+    # ==================== 内部 ====================
     def _update_device_names(self):
         mac = self.bt_manager.get_target_mac()
         sink = None
@@ -218,35 +247,50 @@ class AudioManager:
             raise RuntimeError("未找到蓝牙麦克风设备（source）")
 
     def _start_operation(self, op_type, cmd, wait):
-        with self._state_lock:
-            if self._audio_state != "idle":
-                raise RuntimeError(
-                    f"无法启动{op_type}，当前正在进行 {self._audio_state} 操作"
-                )
-            self._audio_state = op_type
-
-        try:
-            with self._op_lock:
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                )
-        except Exception:
+        """
+        整段用 _op_lock 串行化：
+          - 状态检查 + 置 playing/recording
+          - Popen 子进程
+          - 登记 _active_process
+        这样 stop_audio 一旦拿到 _op_lock，就一定处于「没有任何起/停操作正在进行」的状态。
+        """
+        with self._op_lock:
             with self._state_lock:
-                self._audio_state = "idle"
-            raise
+                if self._audio_state != "idle":
+                    raise RuntimeError(
+                        f"无法启动{op_type}，当前正在进行 {self._audio_state} 操作"
+                    )
+                self._audio_state = op_type
 
-        with self._state_lock:
-            self._active_process = proc
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except Exception:
+                with self._state_lock:
+                    self._audio_state = "idle"
+                raise
 
+            with self._state_lock:
+                self._active_process = proc
+
+        # 锁外等待（同步模式）
         if wait:
             try:
                 proc.wait()
                 if proc.returncode != 0:
                     err = proc.stderr.read() if proc.stderr else ""
-                    raise RuntimeError(f"{op_type}失败，返回码 {proc.returncode}: {err}")
+                    raise RuntimeError(
+                        f"{op_type}失败，返回码 {proc.returncode}: {err}"
+                    )
             finally:
                 with self._state_lock:
-                    self._audio_state = "idle"
-                    self._active_process = None
+                    if self._active_process is proc:
+                        self._audio_state = "idle"
+                        self._active_process = None
             return None
+
         return proc

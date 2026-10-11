@@ -1,35 +1,38 @@
+# bluetooth.py
 import subprocess
 import threading
 import time
 import os
-from typing import Optional
 import re
+from typing import Optional
 
 
-class BluetoothManager:
-    def __init__(self, audio_cfg: dict):
-        self.cfg = self.cfg
-        # 配置字典
-        self._audio_cfg = audio_cfg
+class BluetoothModule:
+    """
+    bluetoothctl 常驻子进程管理：
+      - 不创建线程，由节点创建 stdout_loop / stderr_loop / reconnect_loop
+      - 生命周期 start / shutdown / cleanup
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self._audio_cfg = cfg
+
         # 蓝牙MAC地址
         self._target_mac = self._audio_cfg.get("target_mac", "").strip().upper()
-        # 蓝牙连接轮询间隔
+        # 重连轮询间隔
         self._poll_interval = self._audio_cfg.get("reconnect_poll_interval_sec", 5)
-        # 蓝牙管理器后台线程休眠间隔
+        # 无数据时休眠间隔
         self._thread_sleep = self._audio_cfg.get("thread_sleep_sec", 0.5)
-        # 蓝牙管理器内部循环休眠间隔
+        # 内部循环休眠间隔
         self._inner_loop_sleep = self._audio_cfg.get("inner_loop_sleep_sec", 0.01)
-        # 蓝牙管理器输出缓冲区最大长度
+        # 输出缓冲区
         self._buf_max_len = self._audio_cfg.get("buf_max_len", 2000)
-        # 蓝牙管理器输出缓冲区保留长度
         self._buf_reserve_len = self._audio_cfg.get("buf_reserve_len", 1500)
-        # 蓝牙管理器命令超时时间
+        # 命令超时
         self._cmd_timeout = self._audio_cfg.get("cmd_timeout_sec", 0.5)
-        # 蓝牙管理器线程join超时时间
-        self._thread_join_timeout = self._audio_cfg.get("thread_join_timeout_sec", 1.0)
 
-        # 配置参数边界检查
-
+        # 参数边界检查
         if self._thread_sleep <= 0:
             self._thread_sleep = 0.5
         if self._cmd_timeout <= 0 or self._cmd_timeout > 2:
@@ -37,35 +40,26 @@ class BluetoothManager:
         if self._buf_reserve_len >= self._buf_max_len:
             self._buf_reserve_len = self._buf_max_len - 500
 
-
-        # bluetoothctl子进程
+        # 子进程
         self._proc: Optional[subprocess.Popen] = None
-        # 子进程运行状态
-        self._running = True
-        # 蓝牙连接状态
+
+        # 状态
+        self._running = False
         self._connected = False
-        # 是否启用断线自动重连
         self._auto_reconnect = True
-        # 蓝牙耳机电池电量
         self._battery_level: Optional[int] = None
-        # 输出缓冲区
         self._bt_output_buf = ""
-        # 电量读取正则表达式
+
+        # 正则
         self._battery_re = re.compile(r"\((\d+)\)")
-        # 匹配bluetoothctl提示符：[xxx]#
         self._prompt_re = re.compile(r"\[.*\]#")
-        # 线程安全锁
-        self._state_lock = threading.Lock() # 状态保护
-        self._op_lock = threading.Lock() # 操作保护
-        self._buf_lock = threading.Lock() # 输出缓冲保护
 
-        # 启动 bluetoothctl 常驻进程
-        self._start_btctl()
+        # 锁
+        self._state_lock = threading.Lock()
+        self._op_lock = threading.Lock()
+        self._buf_lock = threading.Lock()
 
-        # 拉起后台线程
-        self._spawn_background_threads()
-
-     # ---------------- 生命周期 ----------------
+    # ==================== 生命周期 ====================
     def start(self):
         with self._state_lock:
             self._running = True
@@ -89,8 +83,14 @@ class BluetoothManager:
                     proc.kill()
                 except Exception:
                     pass
+        # 重置状态
+        with self._state_lock:
+            self._connected = False
+            self._battery_level = None
+            self._auto_reconnect = True
+            self._bt_output_buf = ""
 
-    # ---------------- 进程循环 ----------------
+    # ==================== 进程循环 ====================
     def stdout_loop(self):
         while True:
             with self._state_lock:
@@ -113,7 +113,7 @@ class BluetoothManager:
             self._reconnect_step()
             time.sleep(self._poll_interval)
 
-    # ---------------- 状态查询 ----------------
+    # ==================== 状态查询 ====================
     def is_running(self) -> bool:
         with self._state_lock:
             return self._running
@@ -141,7 +141,7 @@ class BluetoothManager:
     def get_target_mac(self) -> str:
         return self._target_mac
 
-    # ---------------- 业务操作 ----------------
+    # ==================== 业务操作 ====================
     def connect(self) -> bool:
         with self._op_lock:
             if self._check_connected():
@@ -173,7 +173,7 @@ class BluetoothManager:
             self._battery_level = None
             self._auto_reconnect = False
 
-    # ---------------- 内部（子进程操作，调用前须持 _op_lock） ----------------
+    # ==================== 内部（子进程操作，调用前须持 _op_lock） ====================
     def _start_btctl(self):
         with self._op_lock:
             if self._proc is not None and self._proc.poll() is None:
